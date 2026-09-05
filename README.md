@@ -8,12 +8,15 @@ cargo run -p app -- init hello
 cd hello
 cargo run -p app -- build
 cargo run -p app -- run
+cargo run -p app -- run target/app.manifest.json
 ```
 
 `app.toml` declares the application, build, runtime, HTTP endpoint, capabilities,
 and state mount. `app build` creates `target/app.wasm` and
-`target/app.manifest.json`; `app inspect` displays the immutable artifact hash and
-the enforced contract.
+`target/app.manifest.json`; `app run target/app.manifest.json` runs the compiled
+artifact without the source tree as long as the manifest can find `app.wasm`
+beside it. `app inspect` displays the immutable artifact hash and the enforced
+contract.
 
 The v0.1 guest ABI is intentionally small: a guest may export `handle_request`.
 The runtime owns the socket and invokes the guest for every request. State is

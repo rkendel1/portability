@@ -13,19 +13,22 @@ struct HostState {
 }
 
 pub fn run(project: &Path) -> Result<(), String> {
-    let target = project.join("target");
-    let manifest = Manifest::load(&target.join("app.manifest.json"))?;
-    let wasm = fs::read(target.join(&manifest.artifact.path)).map_err(|e| e.to_string())?;
-    if sha256(&wasm) != manifest.artifact.sha256 {
-        return Err("artifact hash does not match manifest".into());
-    }
-    let host_state = host_state(project, &manifest)?;
+    run_from_manifest(&project.join("target/app.manifest.json"), project)
+}
+
+pub fn run_manifest(manifest_path: &Path) -> Result<(), String> {
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    run_from_manifest(manifest_path, manifest_dir)
+}
+
+fn run_from_manifest(manifest_path: &Path, storage_base: &Path) -> Result<(), String> {
+    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let host_state = host_state(storage_base, &manifest)?;
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
-    let http = manifest
-        .capabilities
-        .http
-        .ok_or("no HTTP endpoint declared")?;
+    let http = manifest.http.ok_or("no HTTP endpoint declared")?;
     let listener = TcpListener::bind(("127.0.0.1", http.listen)).map_err(|e| e.to_string())?;
     println!(
         "{} listening on http://127.0.0.1:{}",
@@ -41,13 +44,29 @@ pub fn run(project: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn host_state(project: &Path, manifest: &Manifest) -> Result<HostState, String> {
-    let storage = match (&manifest.state, manifest.capabilities.filesystem.as_slice()) {
-        (Some(state), [mount]) => Some(StorageCapability::new(mount, project.join(&state.path))?),
-        (Some(_), []) => None,
-        (Some(_), _) => return Err("exactly one filesystem storage mount is supported".into()),
-        (None, []) => None,
-        (None, _) => return Err("filesystem capability requires state declaration".into()),
+fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), String> {
+    let manifest = Manifest::load(manifest_path)?;
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    let artifact_path = manifest_dir.join(&manifest.artifact.file);
+    let wasm = fs::read(&artifact_path)
+        .map_err(|e| format!("cannot read artifact {}: {e}", artifact_path.display()))?;
+    if sha256(&wasm) != manifest.artifact.sha256 {
+        return Err("artifact hash mismatch".into());
+    }
+    Ok((manifest, wasm))
+}
+
+fn host_state(storage_base: &Path, manifest: &Manifest) -> Result<HostState, String> {
+    let storage = match (&manifest.storage, manifest.capabilities.filesystem) {
+        (Some(storage), true) => Some(StorageCapability::new(
+            &storage.mount,
+            storage_base.join(&storage.path),
+        )?),
+        (None, false) => None,
+        (None, true) => return Err("filesystem capability requires storage declaration".into()),
+        (Some(_), false) => return Err("storage declaration requires filesystem capability".into()),
     };
     Ok(HostState {
         network: NetworkCapability::new(manifest.capabilities.network),
@@ -366,6 +385,87 @@ mod tests {
             std::env::temp_dir().join(format!("app-runtime-{name}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn manifest_artifact_is_loaded_relative_to_manifest_path() {
+        let tempdir = temp_path("portable-artifact");
+        let artifact = b"portable wasm";
+        fs::write(tempdir.join("app.wasm"), artifact).unwrap();
+        fs::write(
+            tempdir.join("app.manifest.json"),
+            format!(
+                r#"{{
+  "name": "hello",
+  "version": "0.1.0",
+  "runtime": "wasm",
+  "artifact": {{
+    "file": "app.wasm",
+    "sha256": "{}",
+    "size": {}
+  }},
+  "http": {{
+    "listen": 8080
+  }},
+  "capabilities": {{
+    "network": false,
+    "filesystem": true
+  }},
+  "storage": {{
+    "mount": "/data",
+    "path": ".app/data"
+  }}
+}}
+"#,
+                sha256(artifact),
+                artifact.len()
+            ),
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        let result = load_manifest_artifact(&tempdir.join("app.manifest.json"));
+        std::env::set_current_dir(original_dir).unwrap();
+
+        let (manifest, wasm) = result.unwrap();
+        assert_eq!(manifest.artifact.file, "app.wasm");
+        assert_eq!(wasm, artifact);
+    }
+
+    #[test]
+    fn manifest_artifact_hash_mismatch_stops_execution() {
+        let tempdir = temp_path("hash-mismatch");
+        fs::write(tempdir.join("app.wasm"), b"modified").unwrap();
+        fs::write(
+            tempdir.join("app.manifest.json"),
+            format!(
+                r#"{{
+  "name": "hello",
+  "version": "0.1.0",
+  "runtime": "wasm",
+  "artifact": {{
+    "file": "app.wasm",
+    "sha256": "{}",
+    "size": 8
+  }},
+  "http": {{
+    "listen": 8080
+  }},
+  "capabilities": {{
+    "network": false,
+    "filesystem": false
+  }}
+}}
+"#,
+                sha256(b"original")
+            ),
+        )
+        .unwrap();
+
+        let error = load_manifest_artifact(&tempdir.join("app.manifest.json")).unwrap_err();
+
+        assert_eq!(error, "artifact hash mismatch");
     }
 
     #[test]
