@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -14,6 +15,8 @@ pub struct AppSpec {
     pub capabilities: Capabilities,
     #[serde(default)]
     pub storage: Option<Storage>,
+    #[serde(default)]
+    pub secrets: Secrets,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -50,6 +53,12 @@ pub struct Capabilities {
 pub struct Storage {
     pub path: String,
     pub mount: String,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+pub struct Secrets {
+    #[serde(default)]
+    pub required: Vec<String>,
 }
 
 impl AppSpec {
@@ -90,6 +99,18 @@ impl AppSpec {
                 return Err("storage.mount must be an absolute virtual path".into());
             }
         }
+        let mut secret_names = BTreeSet::new();
+        for secret in &self.secrets.required {
+            if !valid_secret_name(secret) {
+                return Err(
+                    "secret names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
+                        .into(),
+                );
+            }
+            if !secret_names.insert(secret) {
+                return Err(format!("duplicate required secret '{secret}'"));
+            }
+        }
 
         Ok(())
     }
@@ -101,6 +122,12 @@ fn default_language() -> String {
 
 fn default_build_target() -> String {
     "wasm".into()
+}
+
+fn valid_secret_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]
@@ -192,6 +219,50 @@ kind = "wasm"
         assert_eq!(
             spec.validate().unwrap_err(),
             "build.language must be 'rust' or 'go'"
+        );
+    }
+
+    #[test]
+    fn parses_required_secret_names() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[secrets]
+required = ["OPENAI_API_KEY"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.secrets.required, ["OPENAI_API_KEY"]);
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_secret_names() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[secrets]
+required = ["openai_api_key"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "secret names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
         );
     }
 }

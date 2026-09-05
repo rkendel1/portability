@@ -48,6 +48,8 @@ enum Command {
         state: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
         state_provider: StateProvider,
+        #[arg(long, value_name = "NAME")]
+        secret: Vec<String>,
     },
     Start {
         manifest: Option<PathBuf>,
@@ -55,6 +57,8 @@ enum Command {
         state: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
         state_provider: StateProvider,
+        #[arg(long, value_name = "NAME")]
+        secret: Vec<String>,
     },
     Status {
         manifest: Option<PathBuf>,
@@ -84,23 +88,32 @@ fn main() {
             manifest,
             state,
             state_provider,
-        } => match manifest {
-            Some(manifest) => app_runtime::run_manifest_with_state_provider(
+            secret,
+        } => resolve_secrets(&secret).and_then(|secrets| match manifest {
+            Some(manifest) => app_runtime::run_manifest_with_state_provider_and_secrets(
                 &manifest,
                 state.as_deref(),
                 state_provider.into(),
+                &secrets,
             ),
-            None => app_runtime::run_with_state_provider(
+            None => app_runtime::run_with_state_provider_and_secrets(
                 Path::new("."),
                 state.as_deref(),
                 state_provider.into(),
+                &secrets,
             ),
-        },
+        }),
         Command::Start {
             manifest,
             state,
             state_provider,
-        } => start(manifest.as_deref(), state.as_deref(), state_provider),
+            secret,
+        } => start(
+            manifest.as_deref(),
+            state.as_deref(),
+            state_provider,
+            &secret,
+        ),
         Command::Status { manifest } => status(manifest.as_deref()),
         Command::Stop { manifest } => stop(manifest.as_deref()),
         Command::Inspect { manifest } => match manifest {
@@ -142,10 +155,17 @@ fn start(
     manifest: Option<&Path>,
     state: Option<&Path>,
     state_provider: StateProvider,
+    secret: &[String],
 ) -> Result<(), String> {
     let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
-    let prepared =
-        app_runtime::prepare_start(manifest_path, Path::new("."), state, state_provider.into())?;
+    let secrets = resolve_secrets(secret)?;
+    let prepared = app_runtime::prepare_start_with_secrets(
+        manifest_path,
+        Path::new("."),
+        state,
+        state_provider.into(),
+        &secrets,
+    )?;
     let mut command =
         std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command.arg("run");
@@ -157,7 +177,11 @@ fn start(
     }
     command
         .arg("--state-provider")
-        .arg(state_provider.to_string())
+        .arg(state_provider.to_string());
+    for name in secret {
+        command.arg("--secret").arg(name);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -176,6 +200,16 @@ fn start(
             Err(error)
         }
     }
+}
+
+fn resolve_secrets(names: &[String]) -> Result<app_runtime::RuntimeSecrets, String> {
+    let mut secrets = app_runtime::RuntimeSecrets::new();
+    for name in names {
+        let value = std::env::var(name)
+            .map_err(|_| format!("secret {name} requested but environment variable is not set"))?;
+        secrets.insert(name.clone(), value);
+    }
+    Ok(secrets)
 }
 
 fn wait_for_started(child: &mut std::process::Child, endpoint: &str) -> Result<(), String> {

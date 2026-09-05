@@ -1,8 +1,9 @@
 use app_capabilities::{
-    CapabilityError, FeltDBStateProvider, NetworkCapability, StorageCapability,
+    CapabilityError, FeltDBStateProvider, NetworkCapability, SecretCapability, StorageCapability,
 };
 use app_manifest::{ApplicationId, Manifest, sha256};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -16,6 +17,7 @@ use wasmtime::{Caller, Engine, Linker, Module, Store};
 struct HostState {
     network: NetworkCapability,
     storage: Option<StorageCapability>,
+    secrets: SecretCapability,
 }
 
 pub fn run(project: &Path) -> Result<(), String> {
@@ -27,6 +29,8 @@ pub enum StateProviderKind {
     Filesystem,
     FeltDB,
 }
+
+pub type RuntimeSecrets = BTreeMap<String, String>;
 
 impl StateProviderKind {
     pub fn label(self) -> &'static str {
@@ -74,11 +78,21 @@ pub fn run_with_state_provider(
     state: Option<&Path>,
     provider: StateProviderKind,
 ) -> Result<(), String> {
+    run_with_state_provider_and_secrets(project, state, provider, &RuntimeSecrets::new())
+}
+
+pub fn run_with_state_provider_and_secrets(
+    project: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<(), String> {
     run_from_manifest(
         &project.join("target/app.manifest.json"),
         project,
         state,
         provider,
+        secrets,
     )
 }
 
@@ -91,7 +105,21 @@ pub fn run_manifest_with_state_provider(
     state: Option<&Path>,
     provider: StateProviderKind,
 ) -> Result<(), String> {
-    run_from_manifest(manifest_path, Path::new("."), state, provider)
+    run_manifest_with_state_provider_and_secrets(
+        manifest_path,
+        state,
+        provider,
+        &RuntimeSecrets::new(),
+    )
+}
+
+pub fn run_manifest_with_state_provider_and_secrets(
+    manifest_path: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<(), String> {
+    run_from_manifest(manifest_path, Path::new("."), state, provider, secrets)
 }
 
 fn run_from_manifest(
@@ -99,8 +127,9 @@ fn run_from_manifest(
     default_state_base: &Path,
     state: Option<&Path>,
     provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
 ) -> Result<(), String> {
-    let runtime = runtime_application(manifest_path, default_state_base, state, provider)?;
+    let runtime = runtime_application(manifest_path, default_state_base, state, provider, secrets)?;
     let manifest = runtime.manifest;
     let wasm = runtime.wasm;
     let host_state = runtime.host_state;
@@ -128,7 +157,23 @@ pub fn prepare_start(
     state: Option<&Path>,
     provider: StateProviderKind,
 ) -> Result<PreparedApplication, String> {
-    let runtime = runtime_application(manifest_path, default_state_base, state, provider)?;
+    prepare_start_with_secrets(
+        manifest_path,
+        default_state_base,
+        state,
+        provider,
+        &RuntimeSecrets::new(),
+    )
+}
+
+pub fn prepare_start_with_secrets(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<PreparedApplication, String> {
+    let runtime = runtime_application(manifest_path, default_state_base, state, provider, secrets)?;
     reject_if_running(&runtime.prepared.application_id)?;
     Ok(runtime.prepared)
 }
@@ -206,6 +251,7 @@ fn runtime_application(
     default_state_base: &Path,
     state: Option<&Path>,
     provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
 ) -> Result<RuntimeApplication, String> {
     let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
     let application_id = manifest.application_id(&wasm)?;
@@ -228,6 +274,7 @@ fn runtime_application(
         provider,
         application_id.as_str(),
         &manifest,
+        secrets,
     )?;
     let listen = manifest
         .http
@@ -256,7 +303,34 @@ fn prepare_status(
     state: Option<&Path>,
     provider: StateProviderKind,
 ) -> Result<PreparedApplication, String> {
-    Ok(runtime_application(manifest_path, default_state_base, state, provider)?.prepared)
+    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let state_location = manifest
+        .storage
+        .as_ref()
+        .map(|storage| {
+            state_root(
+                default_state_base,
+                state,
+                provider,
+                &storage.path,
+                application_id.as_str(),
+            )
+        })
+        .transpose()?;
+    let listen = manifest
+        .http
+        .as_ref()
+        .ok_or("no HTTP endpoint declared")?
+        .listen;
+    Ok(PreparedApplication {
+        application_id,
+        name: manifest.name,
+        endpoint: format!("http://127.0.0.1:{listen}"),
+        state_provider: provider,
+        state_location,
+        artifact_path: artifact_path(manifest_path)?,
+    })
 }
 
 fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), String> {
@@ -291,6 +365,7 @@ fn host_state(
     provider: StateProviderKind,
     application_id: &str,
     manifest: &Manifest,
+    secrets: &RuntimeSecrets,
 ) -> Result<HostState, String> {
     let storage = match (&manifest.storage, manifest.capabilities.filesystem) {
         (Some(storage), true) => {
@@ -319,6 +394,8 @@ fn host_state(
     Ok(HostState {
         network: NetworkCapability::new(manifest.capabilities.network),
         storage,
+        secrets: SecretCapability::new(&manifest.secrets.required, secrets.clone())
+            .map_err(|error| error.to_string())?,
     })
 }
 
@@ -486,6 +563,35 @@ fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
                     .network
                     .connect()
                     .map_err(|error| wasmtime::format_err!("{error}"))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "get_secret",
+            |mut caller: Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             value_ptr: i32,
+             value_len: i32|
+             -> wasmtime::Result<i32> {
+                if value_len < 0 {
+                    return Err(wasmtime::format_err!("guest length must be non-negative"));
+                }
+                let name = guest_string(&mut caller, name_ptr, name_len)?;
+                let value = caller
+                    .data()
+                    .secrets
+                    .get(&name)
+                    .map_err(|error| wasmtime::format_err!("{error}"))?
+                    .as_bytes()
+                    .to_vec();
+                if value.len() > value_len as usize {
+                    return Err(wasmtime::format_err!("secret output buffer too small"));
+                }
+                write_guest_bytes(&mut caller, value_ptr, &value)?;
+                Ok(value.len() as i32)
             },
         )
         .map_err(|e| e.to_string())?;
@@ -749,6 +855,27 @@ mod tests {
         HostState {
             network: NetworkCapability::new(network),
             storage,
+            secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
+        }
+    }
+
+    fn host_state_with_secrets(
+        storage: Option<StorageCapability>,
+        required: &[&str],
+        values: &[(&str, &str)],
+    ) -> HostState {
+        let required = required
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let values = values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        HostState {
+            network: NetworkCapability::new(false),
+            storage,
+            secrets: SecretCapability::new(&required, values).unwrap(),
         }
     }
 
@@ -771,6 +898,7 @@ mod tests {
                 mount: "/data".into(),
                 path: ".app/data".into(),
             }),
+            secrets: app_manifest::Secrets::default(),
         }
     }
 
@@ -876,6 +1004,7 @@ mod tests {
             StateProviderKind::Filesystem,
             "test-application-id",
             &manifest(),
+            &RuntimeSecrets::new(),
         )
         .unwrap()
         .storage
@@ -899,6 +1028,7 @@ mod tests {
             StateProviderKind::Filesystem,
             "test-application-id",
             &manifest(),
+            &RuntimeSecrets::new(),
         )
         .unwrap()
         .storage
@@ -1036,6 +1166,61 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn declared_secret_is_available_at_host_boundary() {
+        let engine = Engine::default();
+        let module = secret_equals_module(&engine, "OPENAI_API_KEY", "test-secret-value");
+
+        invoke(
+            &engine,
+            &module,
+            host_state_with_secrets(
+                None,
+                &["OPENAI_API_KEY"],
+                &[("OPENAI_API_KEY", "test-secret-value")],
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn undeclared_secret_is_denied_at_host_boundary() {
+        let engine = Engine::default();
+        let module = secret_equals_module(&engine, "OTHER_SECRET", "value");
+
+        let error = invoke(
+            &engine,
+            &module,
+            host_state_with_secrets(None, &["OPENAI_API_KEY"], &[("OPENAI_API_KEY", "value")]),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("CapabilityDenied { capability: \"secret\", operation: \"read\" }"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_requires_declared_secret_values() {
+        let mut manifest = manifest();
+        manifest.secrets.required.push("OPENAI_API_KEY".into());
+
+        let error = match super::host_state(
+            &temp_path("secret-project"),
+            None,
+            StateProviderKind::Filesystem,
+            "test-application-id",
+            &manifest,
+            &RuntimeSecrets::new(),
+        ) {
+            Ok(_) => panic!("host state should require declared secret values"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "required secret 'OPENAI_API_KEY' was not provided");
+    }
+
     fn storage_write_module(engine: &Engine, path: &str, value: &str) -> Module {
         module(
             engine,
@@ -1056,6 +1241,56 @@ mod tests {
                 "#,
                 path_len = path.len(),
                 value_len = value.len()
+            ),
+        )
+    }
+
+    fn secret_equals_module(engine: &Engine, name: &str, expected: &str) -> Module {
+        let checks = (0..expected.len())
+            .map(|offset| {
+                format!(
+                    r#"
+                    i32.const {}
+                    i32.load8_u
+                    i32.const {}
+                    i32.load8_u
+                    i32.ne
+                    if
+                      unreachable
+                    end"#,
+                    64 + offset,
+                    128 + offset
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        module(
+            engine,
+            &format!(
+                r#"
+                (module
+                  (import "app_capabilities" "get_secret"
+                    (func $get_secret (param i32 i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "{name}")
+                  (data (i32.const 128) "{expected}")
+                  (func (export "handle_request")
+                    i32.const 0
+                    i32.const {name_len}
+                    i32.const 64
+                    i32.const 128
+                    call $get_secret
+                    i32.const {expected_len}
+                    i32.ne
+                    if
+                      unreachable
+                    end
+                    {checks}))
+                "#,
+                name_len = name.len(),
+                expected = expected,
+                expected_len = expected.len(),
+                checks = checks
             ),
         )
     }

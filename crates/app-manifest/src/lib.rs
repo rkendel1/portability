@@ -14,6 +14,8 @@ pub struct Manifest {
     pub http: Option<HttpCapability>,
     pub capabilities: ManifestCapabilities,
     pub storage: Option<Storage>,
+    #[serde(default, skip_serializing_if = "Secrets::is_empty")]
+    pub secrets: Secrets,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +46,18 @@ pub struct Storage {
     pub path: String,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Secrets {
+    #[serde(default)]
+    pub required: Vec<String>,
+}
+
+impl Secrets {
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty()
+    }
+}
+
 impl Manifest {
     pub fn from_spec(spec: &AppSpec, bytes: &[u8]) -> Self {
         let sha256 = hex(Sha256::digest(bytes).as_slice());
@@ -68,6 +82,9 @@ impl Manifest {
                 mount: s.mount.clone(),
                 path: s.path.clone(),
             }),
+            secrets: Secrets {
+                required: spec.secrets.required.clone(),
+            },
         }
     }
 
@@ -124,6 +141,8 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         http: Option<CanonicalHttp>,
         capabilities: CanonicalCapabilities,
         storage: Option<CanonicalStorage<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secrets: Option<CanonicalSecrets<'a>>,
     }
 
     #[derive(Serialize)]
@@ -150,6 +169,11 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         path: &'a str,
     }
 
+    #[derive(Serialize)]
+    struct CanonicalSecrets<'a> {
+        required: &'a [String],
+    }
+
     let canonical = CanonicalManifest {
         name: &manifest.name,
         version: &manifest.version,
@@ -169,6 +193,9 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         storage: manifest.storage.as_ref().map(|storage| CanonicalStorage {
             mount: &storage.mount,
             path: &storage.path,
+        }),
+        secrets: (!manifest.secrets.required.is_empty()).then_some(CanonicalSecrets {
+            required: &manifest.secrets.required,
         }),
     };
 
@@ -206,6 +233,7 @@ mod tests {
                 mount: "/data".into(),
                 path: ".app/data".into(),
             }),
+            secrets: Secrets::default(),
         }
     }
 
@@ -282,5 +310,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.storage.unwrap().path, ".app/data");
+    }
+
+    #[test]
+    fn manifest_includes_required_secret_names_but_not_values() {
+        let spec = AppSpec {
+            name: "hello".into(),
+            version: "0.1.0".into(),
+            build: app_spec::Build {
+                source: "src".into(),
+                language: "rust".into(),
+                toolchain: None,
+                entry: "src/main.rs".into(),
+                target: "wasm".into(),
+            },
+            runtime: app_spec::Runtime {
+                kind: "wasm".into(),
+            },
+            http: None,
+            capabilities: app_spec::Capabilities::default(),
+            storage: None,
+            secrets: app_spec::Secrets {
+                required: vec!["OPENAI_API_KEY".into()],
+            },
+        };
+        let manifest = Manifest::from_spec(&spec, b"wasm");
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        assert!(json.contains("OPENAI_API_KEY"), "{json}");
+        assert!(!json.contains("test-secret-value"), "{json}");
+    }
+
+    #[test]
+    fn application_id_changes_when_secret_contract_changes() {
+        let original = manifest();
+        let mut changed = manifest();
+        changed.secrets.required.push("OPENAI_API_KEY".into());
+
+        assert_ne!(
+            original.application_id(b"wasm").unwrap(),
+            changed.application_id(b"wasm").unwrap()
+        );
     }
 }

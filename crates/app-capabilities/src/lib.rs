@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -66,6 +67,55 @@ impl NetworkCapability {
 impl Capability for NetworkCapability {
     fn capability(&self) -> &'static str {
         "network"
+    }
+}
+
+#[derive(Clone)]
+pub struct SecretCapability {
+    declared: BTreeSet<String>,
+    values: BTreeMap<String, String>,
+}
+
+impl SecretCapability {
+    pub fn new(
+        required: &[String],
+        values: BTreeMap<String, String>,
+    ) -> Result<Self, CapabilityError> {
+        let declared = required.iter().cloned().collect::<BTreeSet<_>>();
+        for name in values.keys() {
+            if !declared.contains(name) {
+                return Err(CapabilityError::CapabilityDenied {
+                    capability: "secret",
+                    operation: "read",
+                });
+            }
+        }
+        for name in &declared {
+            if !values.contains_key(name) {
+                return Err(CapabilityError::Host(format!(
+                    "required secret '{name}' was not provided"
+                )));
+            }
+        }
+        Ok(Self { declared, values })
+    }
+
+    pub fn get(&self, name: &str) -> Result<&str, CapabilityError> {
+        if !self.declared.contains(name) {
+            return Err(CapabilityError::CapabilityDenied {
+                capability: "secret",
+                operation: "read",
+            });
+        }
+        self.values.get(name).map(String::as_str).ok_or_else(|| {
+            CapabilityError::Host(format!("required secret '{name}' was not provided"))
+        })
+    }
+}
+
+impl Capability for SecretCapability {
+    fn capability(&self) -> &'static str {
+        "secret"
     }
 }
 
