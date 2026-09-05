@@ -55,6 +55,8 @@ fn rust_and_go_examples_build_run_and_persist_state() {
 
         let state_a = temp_project(&format!("{example}-state-a"));
         let state_b = temp_project(&format!("{example}-state-b"));
+        let feltdb_state_a = temp_project(&format!("{example}-feltdb-state-a"));
+        let feltdb_state_b = temp_project(&format!("{example}-feltdb-state-b"));
 
         let mut portable = run_app_manifest_with_state(
             &std::env::temp_dir(),
@@ -63,8 +65,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         );
         wait_for_listen(port, &mut portable);
         assert!(http_get(port, "/").contains("Hello from WASM"));
-        portable.kill().ok();
-        portable.wait().ok();
+        stop_app(port, portable);
         assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
         assert!(!artifact.join(".app/data/counter").exists());
 
@@ -78,17 +79,55 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         );
         wait_for_listen(port, &mut portable);
         assert!(http_get(port, "/").contains("Hello from WASM"));
-        portable.kill().ok();
-        portable.wait().ok();
+        stop_app(port, portable);
         assert_eq!(fs::read_to_string(state_b.join("counter")).unwrap(), "1");
         assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
+        assert!(!artifact.join(".app/data/counter").exists());
+
+        let mut feltdb = run_app_manifest_with_state_provider(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &feltdb_state_a,
+            "feltdb",
+        );
+        wait_for_listen(port, &mut feltdb);
+        assert!(http_get(port, "/").contains("Hello from WASM"));
+        stop_app(port, feltdb);
+        assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
+        assert!(!artifact.join(".app/data/counter").exists());
+
+        let relocated_inspect_after_feltdb =
+            inspect_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
+        assert_eq!(application_id(&relocated_inspect_after_feltdb), built_id);
+        let mut feltdb = run_app_manifest_with_state_provider(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &feltdb_state_a,
+            "feltdb",
+        );
+        wait_for_listen(port, &mut feltdb);
+        assert!(http_get(port, "/").contains("Hello from WASM"));
+        stop_app(port, feltdb);
+        assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
+        assert!(!artifact.join(".app/data/counter").exists());
+
+        let mut isolated_feltdb = run_app_manifest_with_state_provider(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &feltdb_state_b,
+            "feltdb",
+        );
+        wait_for_listen(port, &mut isolated_feltdb);
+        assert!(http_get(port, "/").contains("Hello from WASM"));
+        stop_app(port, isolated_feltdb);
+        assert_eq!(felt_state(&feltdb_state_b, built_id, "counter"), "MQ==");
+        assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
 
         let mut first = run_app(&project);
         wait_for_listen(port, &mut first);
         assert!(http_get(port, "/").contains("Hello from WASM"));
-        first.kill().ok();
-        first.wait().ok();
+        stop_app(port, first);
         assert_eq!(
             fs::read_to_string(project.join(".app/data/counter")).unwrap(),
             "1"
@@ -97,8 +136,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         let mut second = run_app(&project);
         wait_for_listen(port, &mut second);
         assert!(http_get(port, "/").contains("Hello from WASM"));
-        second.kill().ok();
-        second.wait().ok();
+        stop_app(port, second);
         assert_eq!(
             fs::read_to_string(project.join(".app/data/counter")).unwrap(),
             "1"
@@ -324,15 +362,63 @@ fn run_app(project: &Path) -> Child {
 }
 
 fn run_app_manifest_with_state(cwd: &Path, manifest: &Path, state: &Path) -> Child {
+    run_app_manifest_with_state_provider(cwd, manifest, state, "filesystem")
+}
+
+fn run_app_manifest_with_state_provider(
+    cwd: &Path,
+    manifest: &Path,
+    state: &Path,
+    provider: &str,
+) -> Child {
     app(cwd)
         .arg("run")
         .arg(manifest)
         .arg("--state")
         .arg(state)
+        .arg("--state-provider")
+        .arg(provider)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+fn felt_state(state: &Path, application_id: &str, key: &str) -> String {
+    let bridge =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../app-capabilities/feltdb-state-provider.mjs");
+    let output = Command::new("node")
+        .arg(bridge)
+        .arg("read")
+        .arg(state)
+        .arg(application_id)
+        .arg(key)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn stop_app(port: u16, mut child: Child) {
+    child.kill().ok();
+    child.wait().ok();
+    wait_for_port_release(port);
+}
+
+fn wait_for_port_release(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for port {port} to be released");
 }
 
 fn wait_for_listen(port: u16, child: &mut Child) {
@@ -346,10 +432,24 @@ fn wait_for_listen(port: u16, child: &mut Child) {
 
     match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(Ok(line)) if line.contains(&format!("listening on http://127.0.0.1:{port}")) => {}
-        Ok(Ok(line)) => panic!("unexpected app run output before listening: {line}"),
+        Ok(Ok(line)) => panic!(
+            "unexpected app run output before listening: {line}\nstderr:\n{}",
+            child_stderr(child)
+        ),
         Ok(Err(error)) => panic!("failed to read app run output: {error}"),
         Err(_) => panic!("timed out waiting for app run to listen on {port}"),
     }
+}
+
+fn child_stderr(child: &mut Child) -> String {
+    if child.try_wait().ok().flatten().is_none() {
+        return "<still running>".into();
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).ok();
+    }
+    stderr
 }
 
 fn http_get(port: u16, path: &str) -> String {

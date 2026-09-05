@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,31 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StateProvider {
+    Filesystem,
+    #[value(name = "feltdb")]
+    FeltDB,
+}
+
+impl std::fmt::Display for StateProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateProvider::Filesystem => f.write_str("filesystem"),
+            StateProvider::FeltDB => f.write_str("feltdb"),
+        }
+    }
+}
+
+impl From<StateProvider> for app_runtime::StateProviderKind {
+    fn from(provider: StateProvider) -> Self {
+        match provider {
+            StateProvider::Filesystem => app_runtime::StateProviderKind::Filesystem,
+            StateProvider::FeltDB => app_runtime::StateProviderKind::FeltDB,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     Init {
@@ -18,6 +43,8 @@ enum Command {
         manifest: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
         state: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = StateProvider::Filesystem)]
+        state_provider: StateProvider,
     },
     Inspect {
         manifest: Option<PathBuf>,
@@ -37,9 +64,21 @@ fn main() {
             );
             Ok(())
         }),
-        Command::Run { manifest, state } => match manifest {
-            Some(manifest) => app_runtime::run_manifest(&manifest, state.as_deref()),
-            None => app_runtime::run_with_state(Path::new("."), state.as_deref()),
+        Command::Run {
+            manifest,
+            state,
+            state_provider,
+        } => match manifest {
+            Some(manifest) => app_runtime::run_manifest_with_state_provider(
+                &manifest,
+                state.as_deref(),
+                state_provider.into(),
+            ),
+            None => app_runtime::run_with_state_provider(
+                Path::new("."),
+                state.as_deref(),
+                state_provider.into(),
+            ),
         },
         Command::Inspect { manifest } => match manifest {
             Some(manifest) => inspect(&manifest),
