@@ -1,4 +1,6 @@
-use app_capabilities::{CapabilityError, NetworkCapability, StorageCapability};
+use app_capabilities::{
+    CapabilityError, FeltDBStateProvider, NetworkCapability, StorageCapability,
+};
 use app_manifest::{Manifest, sha256};
 use std::fs;
 use std::io::{Read, Write};
@@ -16,21 +18,56 @@ pub fn run(project: &Path) -> Result<(), String> {
     run_with_state(project, None)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateProviderKind {
+    Filesystem,
+    FeltDB,
+}
+
 pub fn run_with_state(project: &Path, state: Option<&Path>) -> Result<(), String> {
-    run_from_manifest(&project.join("target/app.manifest.json"), project, state)
+    run_with_state_provider(project, state, StateProviderKind::Filesystem)
+}
+
+pub fn run_with_state_provider(
+    project: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<(), String> {
+    run_from_manifest(
+        &project.join("target/app.manifest.json"),
+        project,
+        state,
+        provider,
+    )
 }
 
 pub fn run_manifest(manifest_path: &Path, state: Option<&Path>) -> Result<(), String> {
-    run_from_manifest(manifest_path, Path::new("."), state)
+    run_manifest_with_state_provider(manifest_path, state, StateProviderKind::Filesystem)
+}
+
+pub fn run_manifest_with_state_provider(
+    manifest_path: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<(), String> {
+    run_from_manifest(manifest_path, Path::new("."), state, provider)
 }
 
 fn run_from_manifest(
     manifest_path: &Path,
     default_state_base: &Path,
     state: Option<&Path>,
+    provider: StateProviderKind,
 ) -> Result<(), String> {
     let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
-    let host_state = host_state(default_state_base, state, &manifest)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let host_state = host_state(
+        default_state_base,
+        state,
+        provider,
+        &application_id.to_string(),
+        &manifest,
+    )?;
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
     let http = manifest.http.ok_or("no HTTP endpoint declared")?;
@@ -66,6 +103,8 @@ fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), S
 fn host_state(
     default_state_base: &Path,
     state: Option<&Path>,
+    provider: StateProviderKind,
+    application_id: &str,
     manifest: &Manifest,
 ) -> Result<HostState, String> {
     let storage = match (&manifest.storage, manifest.capabilities.filesystem) {
@@ -73,7 +112,16 @@ fn host_state(
             let state_root = state
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_state_base.join(&storage.path));
-            Some(StorageCapability::new(&storage.mount, state_root)?)
+            let storage = match provider {
+                StateProviderKind::Filesystem => {
+                    StorageCapability::new(&storage.mount, state_root)?
+                }
+                StateProviderKind::FeltDB => StorageCapability::with_provider(
+                    &storage.mount,
+                    FeltDBStateProvider::new(state_root, application_id)?,
+                )?,
+            };
+            Some(storage)
         }
         (None, false) => None,
         (None, true) => return Err("filesystem capability requires storage declaration".into()),
@@ -505,10 +553,16 @@ mod tests {
     fn explicit_state_directory_is_storage_root() {
         let project = temp_path("project-default-state");
         let state = temp_path("explicit-state");
-        let storage = super::host_state(&project, Some(&state), &manifest())
-            .unwrap()
-            .storage
-            .unwrap();
+        let storage = super::host_state(
+            &project,
+            Some(&state),
+            StateProviderKind::Filesystem,
+            "test-application-id",
+            &manifest(),
+        )
+        .unwrap()
+        .storage
+        .unwrap();
 
         storage.write("/data/counter", b"explicit").unwrap();
 
@@ -522,10 +576,16 @@ mod tests {
     #[test]
     fn default_state_directory_is_relative_to_runtime_context() {
         let project = temp_path("default-state");
-        let storage = super::host_state(&project, None, &manifest())
-            .unwrap()
-            .storage
-            .unwrap();
+        let storage = super::host_state(
+            &project,
+            None,
+            StateProviderKind::Filesystem,
+            "test-application-id",
+            &manifest(),
+        )
+        .unwrap()
+        .storage
+        .unwrap();
 
         storage.write("/data/counter", b"default").unwrap();
 
