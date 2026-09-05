@@ -70,6 +70,9 @@ impl AppSpec {
         if self.capabilities.filesystem && self.storage.is_none() {
             return Err("filesystem capability requires a [storage] declaration".into());
         }
+        if !self.capabilities.filesystem && self.storage.is_some() {
+            return Err("storage declaration requires filesystem capability".into());
+        }
         if let Some(storage) = &self.storage {
             if !storage.mount.starts_with('/') {
                 return Err("storage.mount must be an absolute virtual path".into());
@@ -102,6 +105,31 @@ filesystem = true
         assert_eq!(
             spec.validate().unwrap_err(),
             "filesystem capability requires a [storage] declaration"
+        );
+    }
+
+    #[test]
+    fn rejects_storage_without_filesystem() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[capabilities]
+filesystem = false
+[storage]
+path = ".app/data"
+mount = "/data"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "storage declaration requires filesystem capability"
         );
     }
 }

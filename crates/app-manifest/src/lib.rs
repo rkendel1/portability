@@ -58,11 +58,14 @@ impl Manifest {
                     .as_ref()
                     .map(|h| HttpCapability { listen: h.listen }),
                 network: spec.capabilities.network,
-                filesystem: spec
-                    .storage
-                    .as_ref()
-                    .map(|s| vec![s.mount.clone()])
-                    .unwrap_or_default(),
+                filesystem: if spec.capabilities.filesystem {
+                    spec.storage
+                        .as_ref()
+                        .map(|s| vec![s.mount.clone()])
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
             },
             state: spec.storage.as_ref().map(|s| State {
                 provider: "local".into(),

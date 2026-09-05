@@ -1,10 +1,16 @@
-use app_capabilities::LocalDirectoryStateProvider;
+use app_capabilities::{CapabilityError, NetworkCapability, StorageCapability};
 use app_manifest::{Manifest, sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Caller, Engine, Linker, Module, Store};
+
+#[derive(Clone)]
+struct HostState {
+    network: NetworkCapability,
+    storage: Option<StorageCapability>,
+}
 
 pub fn run(project: &Path) -> Result<(), String> {
     let target = project.join("target");
@@ -13,9 +19,7 @@ pub fn run(project: &Path) -> Result<(), String> {
     if sha256(&wasm) != manifest.artifact.sha256 {
         return Err("artifact hash does not match manifest".into());
     }
-    if let Some(state) = &manifest.state {
-        LocalDirectoryStateProvider::new(project.join(&state.path))?;
-    }
+    let host_state = host_state(project, &manifest)?;
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
     let http = manifest
@@ -31,19 +35,337 @@ pub fn run(project: &Path) -> Result<(), String> {
         let mut stream = stream.map_err(|e| e.to_string())?;
         let mut request = [0; 1024];
         stream.read(&mut request).map_err(|e| e.to_string())?;
-        invoke(&engine, &module)?;
+        invoke(&engine, &module, host_state.clone())?;
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nHello from WASM").map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-fn invoke(engine: &Engine, module: &Module) -> Result<(), String> {
-    let mut store = Store::new(engine, ());
-    let instance = Instance::new(&mut store, module, &[]).map_err(|e| e.to_string())?;
+fn host_state(project: &Path, manifest: &Manifest) -> Result<HostState, String> {
+    let storage = match (&manifest.state, manifest.capabilities.filesystem.as_slice()) {
+        (Some(state), [mount]) => Some(StorageCapability::new(mount, project.join(&state.path))?),
+        (Some(_), []) => None,
+        (Some(_), _) => return Err("exactly one filesystem storage mount is supported".into()),
+        (None, []) => None,
+        (None, _) => return Err("filesystem capability requires state declaration".into()),
+    };
+    Ok(HostState {
+        network: NetworkCapability::new(manifest.capabilities.network),
+        storage,
+    })
+}
+
+fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(), String> {
+    let mut linker = Linker::new(engine);
+    add_host_functions(&mut linker)?;
+    let mut store = Store::new(engine, host_state);
+    let instance = linker
+        .instantiate(&mut store, module)
+        .map_err(runtime_error)?;
     if let Some(handle) = instance.get_func(&mut store, "handle_request") {
         handle
             .call(&mut store, &[], &mut [])
-            .map_err(|e| e.to_string())?;
+            .map_err(runtime_error)?;
     }
     Ok(())
+}
+
+fn runtime_error(error: wasmtime::Error) -> String {
+    format!("{error:?}")
+}
+
+fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "network_connect",
+            |caller: Caller<'_, HostState>| -> wasmtime::Result<()> {
+                caller
+                    .data()
+                    .network
+                    .connect()
+                    .map_err(|error| wasmtime::format_err!("{error}"))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "storage_write",
+            |mut caller: Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             value_ptr: i32,
+             value_len: i32|
+             -> wasmtime::Result<()> {
+                let path = guest_string(&mut caller, path_ptr, path_len)?;
+                let value = guest_bytes(&mut caller, value_ptr, value_len)?;
+                let storage = caller
+                    .data()
+                    .storage
+                    .as_ref()
+                    .ok_or_else(|| denied("filesystem", "write"))?;
+                storage
+                    .write(&path, &value)
+                    .map_err(|error| wasmtime::format_err!("{error}"))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "storage_read_equals",
+            |mut caller: Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             value_ptr: i32,
+             value_len: i32|
+             -> wasmtime::Result<i32> {
+                let path = guest_string(&mut caller, path_ptr, path_len)?;
+                let expected = guest_bytes(&mut caller, value_ptr, value_len)?;
+                let storage = caller
+                    .data()
+                    .storage
+                    .as_ref()
+                    .ok_or_else(|| denied("filesystem", "read"))?;
+                let actual = storage
+                    .read(&path)
+                    .map_err(|error| wasmtime::format_err!("{error}"))?;
+                Ok(i32::from(actual == expected))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn denied(capability: &'static str, operation: &'static str) -> wasmtime::Error {
+    wasmtime::format_err!(
+        "{}",
+        CapabilityError::CapabilityDenied {
+            capability,
+            operation
+        }
+    )
+}
+
+fn guest_string(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> wasmtime::Result<String> {
+    String::from_utf8(guest_bytes(caller, ptr, len)?).map_err(|e| wasmtime::format_err!("{e}"))
+}
+
+fn guest_bytes(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> wasmtime::Result<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        return Err(wasmtime::format_err!(
+            "guest pointer and length must be non-negative"
+        ));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmtime::format_err!("guest memory export not found"))?;
+    let mut bytes = vec![0; len as usize];
+    memory
+        .read(caller, ptr as usize, &mut bytes)
+        .map_err(|e| wasmtime::format_err!("{e}"))?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn module(engine: &Engine, wat: &str) -> Module {
+        Module::new(engine, wat).unwrap()
+    }
+
+    fn host_state(network: bool, storage: Option<StorageCapability>) -> HostState {
+        HostState {
+            network: NetworkCapability::new(network),
+            storage,
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("app-runtime-{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn network_false_denies_network_operation_at_host_boundary() {
+        let engine = Engine::default();
+        let module = module(
+            &engine,
+            r#"
+            (module
+              (import "app_capabilities" "network_connect" (func $network_connect))
+              (func (export "handle_request")
+                call $network_connect))
+            "#,
+        );
+
+        let error = invoke(&engine, &module, host_state(false, None)).unwrap_err();
+
+        assert!(
+            error.contains("CapabilityDenied { capability: \"network\", operation: \"connect\" }"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn network_true_allows_network_operation_at_host_boundary() {
+        let engine = Engine::default();
+        let module = module(
+            &engine,
+            r#"
+            (module
+              (import "app_capabilities" "network_connect" (func $network_connect))
+              (func (export "handle_request")
+                call $network_connect))
+            "#,
+        );
+
+        invoke(&engine, &module, host_state(true, None)).unwrap();
+    }
+
+    #[test]
+    fn filesystem_false_denies_storage_operation_at_host_boundary() {
+        let engine = Engine::default();
+        let module = storage_write_module(&engine, "/data/counter", "value");
+
+        let error = invoke(&engine, &module, host_state(false, None)).unwrap_err();
+
+        assert!(
+            error.contains("CapabilityDenied { capability: \"filesystem\", operation: \"write\" }"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn filesystem_true_allows_valid_storage_write() {
+        let tempdir = temp_path("valid-write");
+        let storage = StorageCapability::new("/data", &tempdir).unwrap();
+        let engine = Engine::default();
+        let module = storage_write_module(&engine, "/data/foo/bar.txt", "value");
+
+        invoke(&engine, &module, host_state(false, Some(storage))).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tempdir.join("foo/bar.txt")).unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn storage_traversal_is_denied_at_host_boundary() {
+        let tempdir = temp_path("traversal");
+        let storage = StorageCapability::new("/data", &tempdir).unwrap();
+        let engine = Engine::default();
+
+        for path in ["/data/../secret", "/data/a/../../secret"] {
+            let module = storage_write_module(&engine, path, "x");
+            let error =
+                invoke(&engine, &module, host_state(false, Some(storage.clone()))).unwrap_err();
+            assert!(
+                error.contains(
+                    "CapabilityDenied { capability: \"filesystem\", operation: \"write\" }"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_write_persists_across_runtime_restarts() {
+        let tempdir = temp_path("persistence");
+        let engine = Engine::default();
+        let write = storage_write_module(&engine, "/data/counter", "persisted");
+        let read = storage_read_equals_module(&engine, "/data/counter", "persisted");
+
+        invoke(
+            &engine,
+            &write,
+            host_state(
+                false,
+                Some(StorageCapability::new("/data", &tempdir).unwrap()),
+            ),
+        )
+        .unwrap();
+        invoke(
+            &engine,
+            &read,
+            host_state(
+                false,
+                Some(StorageCapability::new("/data", &tempdir).unwrap()),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn storage_write_module(engine: &Engine, path: &str, value: &str) -> Module {
+        module(
+            engine,
+            &format!(
+                r#"
+                (module
+                  (import "app_capabilities" "storage_write"
+                    (func $storage_write (param i32 i32 i32 i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "{path}")
+                  (data (i32.const 64) "{value}")
+                  (func (export "handle_request")
+                    i32.const 0
+                    i32.const {path_len}
+                    i32.const 64
+                    i32.const {value_len}
+                    call $storage_write))
+                "#,
+                path_len = path.len(),
+                value_len = value.len()
+            ),
+        )
+    }
+
+    fn storage_read_equals_module(engine: &Engine, path: &str, value: &str) -> Module {
+        module(
+            engine,
+            &format!(
+                r#"
+                (module
+                  (import "app_capabilities" "storage_read_equals"
+                    (func $storage_read_equals (param i32 i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "{path}")
+                  (data (i32.const 64) "{value}")
+                  (func (export "handle_request")
+                    i32.const 0
+                    i32.const {path_len}
+                    i32.const 64
+                    i32.const {value_len}
+                    call $storage_read_equals
+                    i32.const 1
+                    i32.ne
+                    if
+                      unreachable
+                    end))
+                "#,
+                path_len = path.len(),
+                value_len = value.len()
+            ),
+        )
+    }
 }
