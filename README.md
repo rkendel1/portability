@@ -11,6 +11,7 @@ cargo run -p app -- run
 cargo run -p app -- run target/app.manifest.json
 cargo run -p app -- run target/app.manifest.json --state /var/lib/app/hello --state-provider filesystem
 cargo run -p app -- run target/app.manifest.json --secret OPENAI_API_KEY
+cargo run -p app -- appport-invoke target/appport.manifest.json target/appport.request.json --state /var/lib/app/hello --state-provider filesystem
 LOG_LEVEL=info cargo run -p app -- start target/app.manifest.json
 cargo run -p app -- logs target/app.manifest.json
 ```
@@ -28,10 +29,20 @@ declared state capability to a local directory.
 The Application ID is `sha256:<hash>` over the deployable application: the
 canonical manifest immediately followed by the WASM bytes. The canonical
 manifest is compact JSON with fields emitted in this order: `name`, `version`,
-`runtime`, `artifact`, `http`, `capabilities`, `storage`, `secrets`, `config`,
-`network`, and `resources` when present; nested objects also use the field
+optional `appport`, `runtime`, `artifact`, `http`, `capabilities`, `storage`,
+`secrets`, `config`, `network`, and `resources` when present; nested objects also use the field
 order shown by `target/app.manifest.json`. The manifest's own `artifact.sha256`
 still identifies only the WASM bytes for integrity checks.
+
+AppBoundry can consume an application manifest produced by the published
+`@appport/sdk` package. AppPort `application.id` is preserved as
+`appport.application_id` in the adapted deployable manifest, while the existing
+Application ID remains the immutable identity of the built WASM artifact.
+AppPort capability authorization declarations such as `network`, `filesystem`,
+`storage`, `config`, `secrets`, and `resources` are translated to the existing
+host enforcement layer. WASM artifact, storage, and resource bindings are read
+from non-secret `attributes.appboundry` adapter metadata on the AppPort manifest;
+FeltDB remains only a `StateProvider` implementation behind that boundary.
 
 The v0.1 guest ABI is intentionally small: a guest may export `handle_request`.
 The runtime owns the socket and invokes the guest for every request. State is

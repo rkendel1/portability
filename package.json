@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@appport/sdk": "1.1.2",
     "@feltdb/core": "0.8.3"
   }
 }

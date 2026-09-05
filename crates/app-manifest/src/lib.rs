@@ -1,5 +1,6 @@
 use app_spec::AppSpec;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
@@ -9,6 +10,8 @@ use std::path::Path;
 pub struct Manifest {
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appport: Option<AppPortMapping>,
     pub runtime: String,
     pub artifact: Artifact,
     pub http: Option<HttpCapability>,
@@ -22,6 +25,18 @@ pub struct Manifest {
     pub network: Option<Network>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Resources>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppPortMapping {
+    pub application_id: String,
+    pub operation: AppPortOperation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppPortOperation {
+    pub name: String,
+    pub version: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +111,7 @@ impl Manifest {
         Self {
             name: spec.name.clone(),
             version: spec.version.clone(),
+            appport: None,
             runtime: spec.runtime.kind.clone(),
             artifact: Artifact {
                 file: "app.wasm".into(),
@@ -131,6 +147,141 @@ impl Manifest {
         }
     }
 
+    pub fn from_appport_operation(
+        appport: &Value,
+        operation_name: &str,
+        operation_version: u64,
+        wasm: &[u8],
+    ) -> Result<Self, String> {
+        let protocol = appport
+            .get("protocol")
+            .and_then(Value::as_str)
+            .ok_or("AppPort manifest requires protocol")?;
+        if !protocol.eq_ignore_ascii_case("appport/1") {
+            return Err(format!("unsupported AppPort protocol '{protocol}'"));
+        }
+        let application = appport
+            .get("application")
+            .and_then(Value::as_object)
+            .ok_or("AppPort manifest requires application")?;
+        let appport_application_id = string_field(application, "id", "AppPort application.id")?;
+        let capability = find_appport_capability(appport, operation_name, operation_version)?;
+        let authorization = capability
+            .get("authorization")
+            .and_then(Value::as_array)
+            .ok_or("AppPort capability requires authorization")?;
+        let adapter = appboundry_adapter(appport)?;
+        let filesystem = declares_appport_authorization(authorization, "filesystem")
+            || declares_appport_authorization(authorization, "storage");
+        let network = declares_appport_authorization(authorization, "network");
+        let storage = if filesystem {
+            let storage = adapter.get("storage").and_then(Value::as_object).ok_or(
+                "AppPort filesystem/storage capability requires attributes.appboundry.storage",
+            )?;
+            Some(Storage {
+                mount: string_field(storage, "mount", "attributes.appboundry.storage.mount")?,
+                path: storage
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".app/data")
+                    .to_string(),
+            })
+        } else {
+            None
+        };
+        let resources = if declares_appport_authorization(authorization, "resources") {
+            let resources = adapter
+                .get("resources")
+                .and_then(Value::as_object)
+                .ok_or("AppPort resources capability requires attributes.appboundry.resources")?;
+            Some(Resources {
+                memory_mb: u64_field(
+                    resources,
+                    "memory_mb",
+                    "attributes.appboundry.resources.memory_mb",
+                )
+                .or_else(|_| {
+                    u64_field(
+                        resources,
+                        "memoryMb",
+                        "attributes.appboundry.resources.memoryMb",
+                    )
+                })?,
+                timeout_ms: u64_field(
+                    resources,
+                    "timeout_ms",
+                    "attributes.appboundry.resources.timeout_ms",
+                )
+                .or_else(|_| {
+                    u64_field(
+                        resources,
+                        "timeoutMs",
+                        "attributes.appboundry.resources.timeoutMs",
+                    )
+                })?,
+                max_concurrent_requests: resources
+                    .get("max_concurrent_requests")
+                    .or_else(|| resources.get("maxConcurrentRequests"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as u32,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            name: string_field(application, "name", "AppPort application.name")?,
+            version: string_field(application, "version", "AppPort application.version")?,
+            appport: Some(AppPortMapping {
+                application_id: appport_application_id,
+                operation: AppPortOperation {
+                    name: operation_name.to_string(),
+                    version: operation_version,
+                },
+            }),
+            runtime: adapter
+                .get("runtime")
+                .and_then(Value::as_str)
+                .unwrap_or("wasm")
+                .to_string(),
+            artifact: Artifact {
+                file: appport_artifact_file(appport)?,
+                sha256: sha256(wasm),
+                size: wasm.len() as u64,
+            },
+            http: adapter
+                .get("http")
+                .and_then(Value::as_object)
+                .and_then(|http| http.get("listen"))
+                .and_then(Value::as_u64)
+                .map(|listen| HttpCapability {
+                    listen: listen as u16,
+                }),
+            capabilities: ManifestCapabilities {
+                network,
+                filesystem,
+            },
+            storage,
+            secrets: if declares_appport_authorization(authorization, "secrets") {
+                Secrets {
+                    required: string_array(adapter, "secrets", "required")?,
+                }
+            } else {
+                Secrets::default()
+            },
+            config: if declares_appport_authorization(authorization, "config") {
+                Config {
+                    allowed: string_array(adapter, "config", "allowed")?,
+                }
+            } else {
+                Config::default()
+            },
+            network: network.then(|| Network {
+                outbound: string_array(adapter, "network", "outbound").unwrap_or_default(),
+            }),
+            resources,
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         serde_json::from_reader(fs::File::open(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())
@@ -150,6 +301,15 @@ impl Manifest {
     pub fn application_id(&self, wasm: &[u8]) -> Result<ApplicationId, String> {
         ApplicationId::from_manifest_and_wasm(self, wasm)
     }
+}
+
+pub fn appport_artifact_file(appport: &Value) -> Result<String, String> {
+    Ok(appboundry_adapter(appport)?
+        .get("artifact")
+        .and_then(|artifact| artifact.get("file"))
+        .and_then(Value::as_str)
+        .unwrap_or("app.wasm")
+        .to_string())
 }
 
 impl ApplicationId {
@@ -179,6 +339,8 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
     struct CanonicalManifest<'a> {
         name: &'a str,
         version: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        appport: Option<CanonicalAppPort<'a>>,
         runtime: &'a str,
         artifact: CanonicalArtifact<'a>,
         http: Option<CanonicalHttp>,
@@ -199,6 +361,18 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         file: &'a str,
         sha256: &'a str,
         size: u64,
+    }
+
+    #[derive(Serialize)]
+    struct CanonicalAppPort<'a> {
+        application_id: &'a str,
+        operation: CanonicalAppPortOperation<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct CanonicalAppPortOperation<'a> {
+        name: &'a str,
+        version: u64,
     }
 
     #[derive(Serialize)]
@@ -243,6 +417,13 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
     let canonical = CanonicalManifest {
         name: &manifest.name,
         version: &manifest.version,
+        appport: manifest.appport.as_ref().map(|appport| CanonicalAppPort {
+            application_id: &appport.application_id,
+            operation: CanonicalAppPortOperation {
+                name: &appport.operation.name,
+                version: appport.operation.version,
+            },
+        }),
         runtime: &manifest.runtime,
         artifact: CanonicalArtifact {
             file: &manifest.artifact.file,
@@ -282,6 +463,93 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&canonical).map_err(|e| e.to_string())
 }
 
+fn find_appport_capability<'a>(
+    appport: &'a Value,
+    operation_name: &str,
+    operation_version: u64,
+) -> Result<&'a Value, String> {
+    appport
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .ok_or("AppPort manifest requires capabilities")?
+        .iter()
+        .find(|capability| {
+            capability.get("name").and_then(Value::as_str) == Some(operation_name)
+                && capability
+                    .get("versions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|version| version.as_u64() == Some(operation_version))
+                    })
+        })
+        .ok_or_else(|| {
+            format!("AppPort operation {operation_name}@{operation_version} is not declared")
+        })
+}
+
+fn appboundry_adapter(appport: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    appport
+        .get("attributes")
+        .and_then(|attributes| attributes.get("appboundry"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "AppPort manifest requires attributes.appboundry adapter metadata".into())
+}
+
+fn declares_appport_authorization(authorization: &[Value], capability: &str) -> bool {
+    authorization.iter().filter_map(Value::as_str).any(|token| {
+        token == capability
+            || token.ends_with(&format!(".{capability}"))
+            || token.ends_with(&format!(":{capability}"))
+            || token.ends_with(&format!("/{capability}"))
+    })
+}
+
+fn string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<String, String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label} must be a string"))
+}
+
+fn u64_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<u64, String> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{label} must be an integer"))
+}
+
+fn string_array(
+    adapter: &serde_json::Map<String, Value>,
+    section: &str,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let Some(section_value) = adapter.get(section) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = section_value.get(field).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                format!("attributes.appboundry.{section}.{field} must contain only strings")
+            })
+        })
+        .collect()
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -302,6 +570,7 @@ mod tests {
         Manifest {
             name: "hello".into(),
             version: "0.1.0".into(),
+            appport: None,
             runtime: "wasm".into(),
             artifact: Artifact {
                 file: "app.wasm".into(),
@@ -484,5 +753,64 @@ mod tests {
         assert!(json.contains("LOG_LEVEL"), "{json}");
         assert!(json.contains("api.example.com"), "{json}");
         assert!(json.contains("memory_mb"), "{json}");
+    }
+
+    #[test]
+    fn appport_operation_maps_identity_and_capabilities_to_manifest() {
+        let appport: Value = serde_json::from_str(
+            r#"
+{
+  "protocol": "appport/1",
+  "application": {
+    "id": "com.example.hello",
+    "name": "hello",
+    "version": "0.1.0"
+  },
+  "capabilities": [
+    {
+      "name": "hello.request",
+      "versions": [1],
+      "latestVersion": 1,
+      "kind": "request",
+      "authorization": ["network", "filesystem", "storage", "config", "secrets", "resources"]
+    }
+  ],
+  "events": [],
+  "transports": [],
+  "attributes": {
+    "appboundry": {
+      "runtime": "wasm",
+      "artifact": { "file": "app.wasm" },
+      "storage": { "mount": "/data", "path": ".app/data" },
+      "config": { "allowed": ["LOG_LEVEL"] },
+      "secrets": { "required": ["OPENAI_API_KEY"] },
+      "network": { "outbound": ["api.example.com"] },
+      "resources": {
+        "memory_mb": 256,
+        "timeout_ms": 30000,
+        "max_concurrent_requests": 1
+      }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let manifest =
+            Manifest::from_appport_operation(&appport, "hello.request", 1, b"wasm").unwrap();
+
+        assert_eq!(manifest.name, "hello");
+        assert_eq!(
+            manifest.appport.unwrap().application_id,
+            "com.example.hello"
+        );
+        assert!(manifest.capabilities.network);
+        assert!(manifest.capabilities.filesystem);
+        assert_eq!(manifest.storage.unwrap().mount, "/data");
+        assert_eq!(manifest.config.allowed, ["LOG_LEVEL"]);
+        assert_eq!(manifest.secrets.required, ["OPENAI_API_KEY"]);
+        assert_eq!(manifest.network.unwrap().outbound, ["api.example.com"]);
+        assert_eq!(manifest.resources.unwrap().memory_mb, 256);
     }
 }
