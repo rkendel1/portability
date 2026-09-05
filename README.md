@@ -18,6 +18,13 @@ artifact without the source tree as long as the manifest can find `app.wasm`
 beside it. `app inspect` displays the immutable artifact hash and the enforced
 contract.
 
+The Application ID is `sha256:<hash>` over the deployable application: the
+canonical manifest immediately followed by the WASM bytes. The canonical
+manifest is compact JSON with fields emitted in this order: `name`, `version`,
+`runtime`, `artifact`, `http`, `capabilities`, `storage`; nested objects also use
+the field order shown by `target/app.manifest.json`. The manifest's own
+`artifact.sha256` still identifies only the WASM bytes for integrity checks.
+
 The v0.1 guest ABI is intentionally small: a guest may export `handle_request`.
 The runtime owns the socket and invokes the guest for every request. State is
 provided through an explicit local-directory capability; paths cannot escape its
