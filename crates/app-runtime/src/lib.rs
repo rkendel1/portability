@@ -25,7 +25,7 @@ pub enum StateProviderKind {
 }
 
 pub fn run_with_state(project: &Path, state: Option<&Path>) -> Result<(), String> {
-    run_with_state_provider(project, state, StateProviderKind::Filesystem)
+    run_with_state_provider(project, state, StateProviderKind::FeltDB)
 }
 
 pub fn run_with_state_provider(
@@ -42,7 +42,7 @@ pub fn run_with_state_provider(
 }
 
 pub fn run_manifest(manifest_path: &Path, state: Option<&Path>) -> Result<(), String> {
-    run_manifest_with_state_provider(manifest_path, state, StateProviderKind::Filesystem)
+    run_manifest_with_state_provider(manifest_path, state, StateProviderKind::FeltDB)
 }
 
 pub fn run_manifest_with_state_provider(
@@ -109,9 +109,13 @@ fn host_state(
 ) -> Result<HostState, String> {
     let storage = match (&manifest.storage, manifest.capabilities.filesystem) {
         (Some(storage), true) => {
-            let state_root = state
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_state_base.join(&storage.path));
+            let state_root = state_root(
+                default_state_base,
+                state,
+                provider,
+                &storage.path,
+                application_id,
+            )?;
             let storage = match provider {
                 StateProviderKind::Filesystem => {
                     StorageCapability::new(&storage.mount, state_root)?
@@ -131,6 +135,40 @@ fn host_state(
         network: NetworkCapability::new(manifest.capabilities.network),
         storage,
     })
+}
+
+fn state_root(
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    storage_path: &str,
+    application_id: &str,
+) -> Result<PathBuf, String> {
+    if let Some(state) = state {
+        return Ok(state.to_path_buf());
+    }
+    match provider {
+        StateProviderKind::Filesystem => Ok(default_state_base.join(storage_path)),
+        StateProviderKind::FeltDB => default_feltdb_state_root(application_id),
+    }
+}
+
+fn default_feltdb_state_root(application_id: &str) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot determine home directory for default FeltDB state".to_string())?;
+    Ok(feltdb_state_root(&home, application_id))
+}
+
+fn feltdb_state_root(home: &Path, application_id: &str) -> PathBuf {
+    let mut root = home.join(".appboundry").join("state");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            root.push(segment);
+        }
+    }
+    root
 }
 
 fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(), String> {
@@ -592,6 +630,19 @@ mod tests {
         assert_eq!(
             fs::read_to_string(project.join(".app/data/counter")).unwrap(),
             "default"
+        );
+    }
+
+    #[test]
+    fn default_feltdb_state_directory_uses_application_id_under_home() {
+        let home = temp_path("feltdb-home");
+
+        assert_eq!(
+            super::feltdb_state_root(&home, "sha256:abc123"),
+            home.join(".appboundry")
+                .join("state")
+                .join("sha256")
+                .join("abc123")
         );
     }
 

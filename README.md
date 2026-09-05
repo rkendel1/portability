@@ -8,16 +8,18 @@ cargo run -p app -- init hello
 cd hello
 cargo run -p app -- build
 cargo run -p app -- run
-cargo run -p app -- run target/app.manifest.json --state /var/lib/app/hello
+cargo run -p app -- run target/app.manifest.json
+cargo run -p app -- run target/app.manifest.json --state /var/lib/app/hello --state-provider filesystem
 ```
 
 `app.toml` declares the application, build, runtime, HTTP endpoint, capabilities,
 and state mount. `app build` creates `target/app.wasm` and
 `target/app.manifest.json`; `app run target/app.manifest.json` runs the compiled
 artifact without the source tree as long as the manifest can find `app.wasm`
-beside it. Persistent state is runtime configuration: pass `--state DIR` to bind
-the declared state capability to a local directory. For local development,
-`app run` still defaults to `.app/data/` outside the deployable artifact.
+beside it. Persistent state defaults to FeltDB under
+`~/.appboundry/state/<Application ID>` without the application managing a
+database. Pass `--state DIR --state-provider filesystem` to explicitly bind the
+declared state capability to a local directory.
 `app inspect` displays the immutable artifact hash and the enforced contract.
 
 The Application ID is `sha256:<hash>` over the deployable application: the

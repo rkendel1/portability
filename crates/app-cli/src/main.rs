@@ -43,7 +43,7 @@ enum Command {
         manifest: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
         state: Option<PathBuf>,
-        #[arg(long, value_enum, default_value_t = StateProvider::Filesystem)]
+        #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
         state_provider: StateProvider,
     },
     Inspect {
