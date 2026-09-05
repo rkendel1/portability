@@ -245,6 +245,9 @@ fn add_wasi_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
             "wasi_snapshot_preview1",
             "random_get",
             |mut caller: Caller<'_, HostState>, buf: i32, len: i32| -> wasmtime::Result<i32> {
+                if len < 0 {
+                    return Err(wasmtime::format_err!("guest length must be non-negative"));
+                }
                 write_guest_bytes(&mut caller, buf, &vec![0; len as usize])?;
                 Ok(0)
             },
