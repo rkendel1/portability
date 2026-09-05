@@ -9,9 +9,16 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub runtime: String,
+    pub build: Build,
     pub artifact: Artifact,
     pub capabilities: ManifestCapabilities,
     pub state: Option<State>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Build {
+    pub language: String,
+    pub target: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +54,10 @@ impl Manifest {
             name: spec.name.clone(),
             version: spec.version.clone(),
             runtime: spec.runtime.kind.clone(),
+            build: Build {
+                language: spec.build.language.clone(),
+                target: spec.build.target.clone(),
+            },
             artifact: Artifact {
                 path: "app.wasm".into(),
                 sha256,

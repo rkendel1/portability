@@ -19,7 +19,13 @@ pub struct AppSpec {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Build {
     pub source: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default)]
+    pub toolchain: Option<String>,
     pub entry: String,
+    #[serde(default = "default_build_target")]
+    pub target: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -67,6 +73,12 @@ impl AppSpec {
         if self.runtime.kind != "wasm" {
             return Err("runtime.kind must be 'wasm'".into());
         }
+        if self.build.target != "wasm" {
+            return Err("build.target must be 'wasm'".into());
+        }
+        if !matches!(self.build.language.as_str(), "rust" | "go") {
+            return Err("build.language must be 'rust' or 'go'".into());
+        }
         if self.capabilities.filesystem && self.storage.is_none() {
             return Err("filesystem capability requires a [storage] declaration".into());
         }
@@ -78,8 +90,17 @@ impl AppSpec {
                 return Err("storage.mount must be an absolute virtual path".into());
             }
         }
+
         Ok(())
     }
+}
+
+fn default_language() -> String {
+    "rust".into()
+}
+
+fn default_build_target() -> String {
+    "wasm".into()
 }
 
 #[cfg(test)]
@@ -130,6 +151,47 @@ mount = "/data"
         assert_eq!(
             spec.validate().unwrap_err(),
             "storage declaration requires filesystem capability"
+        );
+    }
+
+    #[test]
+    fn defaults_build_language_to_rust_wasm() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.build.language, "rust");
+        assert_eq!(spec.build.target, "wasm");
+    }
+
+    #[test]
+    fn rejects_unknown_build_language() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+language = "python"
+entry = "src/main.py"
+target = "wasm"
+[runtime]
+kind = "wasm"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "build.language must be 'rust' or 'go'"
         );
     }
 }

@@ -62,6 +62,11 @@ fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(),
     let instance = linker
         .instantiate(&mut store, module)
         .map_err(runtime_error)?;
+    if let Some(initialize) = instance.get_func(&mut store, "_initialize") {
+        initialize
+            .call(&mut store, &[], &mut [])
+            .map_err(runtime_error)?;
+    }
     if let Some(handle) = instance.get_func(&mut store, "handle_request") {
         handle
             .call(&mut store, &[], &mut [])
@@ -75,6 +80,7 @@ fn runtime_error(error: wasmtime::Error) -> String {
 }
 
 fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
+    add_wasi_functions(linker)?;
     linker
         .func_wrap(
             "app_capabilities",
@@ -138,6 +144,133 @@ fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
     Ok(())
 }
 
+fn add_wasi_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
+    linker
+        .func_wrap("wasi_snapshot_preview1", "sched_yield", || -> i32 { 0 })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            |code: i32| -> wasmtime::Result<()> {
+                Err(wasmtime::format_err!("guest exited with status {code}"))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "args_get",
+            |_argv: i32, _argv_buf: i32| -> i32 { 0 },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "args_sizes_get",
+            |mut caller: Caller<'_, HostState>,
+             argc: i32,
+             argv_buf_size: i32|
+             -> wasmtime::Result<i32> {
+                write_u32(&mut caller, argc, 0)?;
+                write_u32(&mut caller, argv_buf_size, 0)?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "clock_time_get",
+            |mut caller: Caller<'_, HostState>,
+             _clock_id: i32,
+             _precision: i64,
+             time: i32|
+             -> wasmtime::Result<i32> {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| wasmtime::format_err!("{e}"))?
+                    .as_nanos() as u64;
+                write_u64(&mut caller, time, nanos)?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "environ_get",
+            |_environ: i32, _environ_buf: i32| -> i32 { 0 },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "environ_sizes_get",
+            |mut caller: Caller<'_, HostState>,
+             environ_count: i32,
+             environ_buf_size: i32|
+             -> wasmtime::Result<i32> {
+                write_u32(&mut caller, environ_count, 0)?;
+                write_u32(&mut caller, environ_buf_size, 0)?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            |mut caller: Caller<'_, HostState>,
+             _fd: i32,
+             iovs: i32,
+             iovs_len: i32,
+             nwritten: i32|
+             -> wasmtime::Result<i32> {
+                let mut output = Vec::new();
+                for index in 0..iovs_len {
+                    let ptr = read_u32(&mut caller, iovs + index * 8)? as i32;
+                    let len = read_u32(&mut caller, iovs + index * 8 + 4)?;
+                    output.extend(guest_bytes(&mut caller, ptr, len as i32)?);
+                }
+                let written = output.len() as u32;
+                eprint!("{}", String::from_utf8_lossy(&output));
+                write_u32(&mut caller, nwritten, written)?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "random_get",
+            |mut caller: Caller<'_, HostState>, buf: i32, len: i32| -> wasmtime::Result<i32> {
+                if len < 0 {
+                    return Err(wasmtime::format_err!("guest length must be non-negative"));
+                }
+                write_guest_bytes(&mut caller, buf, &vec![0; len as usize])?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "poll_oneoff",
+            |mut caller: Caller<'_, HostState>,
+             _in: i32,
+             _out: i32,
+             _nsubscriptions: i32,
+             nevents: i32|
+             -> wasmtime::Result<i32> {
+                write_u32(&mut caller, nevents, 0)?;
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn denied(capability: &'static str, operation: &'static str) -> wasmtime::Error {
     wasmtime::format_err!(
         "{}",
@@ -146,6 +279,36 @@ fn denied(capability: &'static str, operation: &'static str) -> wasmtime::Error 
             operation
         }
     )
+}
+
+fn read_u32(caller: &mut Caller<'_, HostState>, ptr: i32) -> wasmtime::Result<u32> {
+    let bytes = guest_bytes(caller, ptr, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> wasmtime::Result<()> {
+    write_guest_bytes(caller, ptr, &value.to_le_bytes())
+}
+
+fn write_u64(caller: &mut Caller<'_, HostState>, ptr: i32, value: u64) -> wasmtime::Result<()> {
+    write_guest_bytes(caller, ptr, &value.to_le_bytes())
+}
+
+fn write_guest_bytes(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    bytes: &[u8],
+) -> wasmtime::Result<()> {
+    if ptr < 0 {
+        return Err(wasmtime::format_err!("guest pointer must be non-negative"));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmtime::format_err!("guest memory export not found"))?;
+    memory
+        .write(caller, ptr as usize, bytes)
+        .map_err(|e| wasmtime::format_err!("{e}"))
 }
 
 fn guest_string(
