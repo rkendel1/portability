@@ -1,7 +1,9 @@
 use std::fs;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 #[test]
 fn sdk_appport_application_invokes_wasm_and_persists_state() {
@@ -14,7 +16,7 @@ fn sdk_appport_application_invokes_wasm_and_persists_state() {
 
     let target = project.join("target");
     let appport_manifest = target.join("appport.manifest.json");
-    write_appport_manifest_with_sdk(&appport_manifest);
+    write_appport_manifest_with_sdk(&appport_manifest, None);
     let request = target.join("appport.request.json");
     fs::write(
         &request,
@@ -51,7 +53,81 @@ fn sdk_appport_application_invokes_wasm_and_persists_state() {
     assert!(!target.join(".app/data/counter").exists());
 }
 
-fn write_appport_manifest_with_sdk(path: &Path) {
+#[test]
+fn sdk_appport_application_uses_appboundry_lifecycle_and_keeps_state_across_restart() {
+    if !rust_wasm_target_available() {
+        return;
+    }
+    let project = copy_example("hello");
+    let port = free_port();
+    rewrite_listen(&project, port);
+    app(&project).arg("build").assert_success();
+
+    let target = project.join("target");
+    let appport_manifest = target.join("appport.manifest.json");
+    write_appport_manifest_with_sdk(&appport_manifest, Some(port));
+    let home = temp_project("appport-lifecycle-home");
+
+    let started = appport_start_with_home(&project, &appport_manifest, &home);
+    assert!(started.contains("Started hello"), "{started}");
+    assert!(
+        started.contains("AppPort Application ID: com.example.hello"),
+        "{started}"
+    );
+    let application_id = appboundry_application_id(&started);
+    wait_for_http(port);
+    let state = default_feltdb_state(&home, application_id);
+    assert_eq!(felt_state(&state, application_id, "counter"), "MQ==");
+
+    let status = appport_status_with_home(&project, &appport_manifest, &home);
+    assert!(
+        status.contains("AppPort Application ID: com.example.hello"),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("AppBoundry Application ID: {application_id}")),
+        "{status}"
+    );
+    assert!(status.contains("Execution: running"), "{status}");
+    assert!(status.contains("Artifact: verified"), "{status}");
+    assert!(status.contains("State Provider: feltdb"), "{status}");
+    assert!(
+        status.contains(&format!("State Scope: {application_id}")),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("Endpoint: http://127.0.0.1:{port}")),
+        "{status}"
+    );
+
+    let stopped = appport_stop_with_home(&project, &appport_manifest, &home);
+    assert!(stopped.contains("Execution: stopped"), "{stopped}");
+    wait_for_port_release(port);
+
+    let restarted = appport_start_with_home(&project, &appport_manifest, &home);
+    assert!(
+        restarted.contains(&format!("AppBoundry Application ID: {application_id}")),
+        "{restarted}"
+    );
+    wait_for_http(port);
+    assert_eq!(felt_state(&state, application_id, "counter"), "MQ==");
+
+    let logs = fs::read_to_string(runtime_log_path(&home, application_id)).unwrap();
+    assert!(
+        logs.contains(&format!("execution-unit {application_id}#1 create")),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(&format!("execution-unit {application_id}#2 create")),
+        "{logs}"
+    );
+
+    let stopped = appport_stop_with_home(&project, &appport_manifest, &home);
+    assert!(stopped.contains("Execution: stopped"), "{stopped}");
+    wait_for_port_release(port);
+}
+
+fn write_appport_manifest_with_sdk(path: &Path, listen: Option<u16>) {
     let output = Command::new("node")
         .current_dir(repository_root())
         .arg("--input-type=module")
@@ -85,6 +161,7 @@ const manifest = application.manifest();
 manifest.attributes = {
   appboundry: {
     runtime: "wasm",
+    operation: { name: "hello.request", version: 1 },
     artifact: { file: "app.wasm" },
     storage: { mount: "/data", path: ".app/data" },
     resources: {
@@ -94,10 +171,17 @@ manifest.attributes = {
     }
   }
 };
+if (process.env.APPBOUNDRY_LISTEN) {
+  manifest.attributes.appboundry.http = { listen: Number(process.env.APPBOUNDRY_LISTEN) };
+}
 fs.writeFileSync(process.env.APPPORT_MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`);
 "#,
         )
         .env("APPPORT_MANIFEST", path)
+        .env(
+            "APPBOUNDRY_LISTEN",
+            listen.map(|port| port.to_string()).unwrap_or_default(),
+        )
         .output()
         .unwrap();
     assert!(
@@ -136,6 +220,35 @@ fn successful_output(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn appport_start_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(
+        app(cwd)
+            .arg("appport-start")
+            .arg(manifest)
+            .env("HOME", home),
+    )
+}
+
+fn appport_status_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(
+        app(cwd)
+            .arg("appport-status")
+            .arg(manifest)
+            .env("HOME", home),
+    )
+}
+
+fn appport_stop_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(app(cwd).arg("appport-stop").arg(manifest).env("HOME", home))
+}
+
+fn appboundry_application_id(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("AppBoundry Application ID: "))
+        .unwrap()
 }
 
 trait AssertCommand {
@@ -215,4 +328,75 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn default_feltdb_state(home: &Path, application_id: &str) -> PathBuf {
+    let mut path = home.join(".appboundry").join("state");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path
+}
+
+fn runtime_log_path(home: &Path, application_id: &str) -> PathBuf {
+    let mut path = home.join(".appboundry").join("runtime");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path.join("runtime.log")
+}
+
+fn felt_state(state: &Path, application_id: &str, key: &str) -> String {
+    let bridge =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../app-capabilities/feltdb-state-provider.mjs");
+    let output = Command::new("node")
+        .arg(bridge)
+        .arg("read")
+        .arg(state)
+        .arg(application_id)
+        .arg(key)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn wait_for_http(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).ok();
+            if response.contains("Hello from WASM") {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for http://127.0.0.1:{port}");
+}
+
+fn wait_for_port_release(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for port {port} to be released");
 }

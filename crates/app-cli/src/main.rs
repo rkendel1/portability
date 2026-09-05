@@ -62,6 +62,34 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         secret: Vec<String>,
     },
+    #[command(name = "appport-start")]
+    AppPortStart {
+        appport_manifest: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
+        state_provider: StateProvider,
+        #[arg(long, value_name = "NAME")]
+        secret: Vec<String>,
+    },
+    #[command(name = "appport-status")]
+    AppPortStatus {
+        appport_manifest: PathBuf,
+    },
+    #[command(name = "appport-stop")]
+    AppPortStop {
+        appport_manifest: PathBuf,
+    },
+    #[command(name = "appport-run", hide = true)]
+    AppPortRun {
+        appport_manifest: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
+        state_provider: StateProvider,
+        #[arg(long, value_name = "NAME")]
+        secret: Vec<String>,
+    },
     Start {
         manifest: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
@@ -133,6 +161,27 @@ fn main() {
             )?;
             println!("{response}");
             Ok(())
+        }),
+        Command::AppPortStart {
+            appport_manifest,
+            state,
+            state_provider,
+            secret,
+        } => appport_start(&appport_manifest, state.as_deref(), state_provider, &secret),
+        Command::AppPortStatus { appport_manifest } => appport_status(&appport_manifest),
+        Command::AppPortStop { appport_manifest } => appport_stop(&appport_manifest),
+        Command::AppPortRun {
+            appport_manifest,
+            state,
+            state_provider,
+            secret,
+        } => resolve_secrets(&secret).and_then(|secrets| {
+            app_runtime::run_appport_manifest_with_state_provider_and_secrets(
+                &appport_manifest,
+                state.as_deref(),
+                state_provider.into(),
+                &secrets,
+            )
         }),
         Command::Start {
             manifest,
@@ -236,6 +285,62 @@ fn start(
     }
 }
 
+fn appport_start(
+    appport_manifest: &Path,
+    state: Option<&Path>,
+    state_provider: StateProvider,
+    secret: &[String],
+) -> Result<(), String> {
+    let secrets = resolve_secrets(secret)?;
+    let prepared = app_runtime::prepare_appport_start_with_secrets(
+        appport_manifest,
+        Path::new("."),
+        state,
+        state_provider.into(),
+        &secrets,
+    )?;
+    let mut command =
+        std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    command.arg("appport-run").arg(appport_manifest);
+    if let Some(state) = state {
+        command.arg("--state").arg(state);
+    }
+    command
+        .arg("--state-provider")
+        .arg(state_provider.to_string());
+    for name in secret {
+        command.arg("--secret").arg(name);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let log_path = app_runtime::log_path_for_application_id(&prepared.application_id)?;
+    command.env("APP_RUNTIME_LOG", &log_path);
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    wait_for_started(&mut child, &prepared.endpoint)?;
+    match app_runtime::record_started(prepared, child.id()) {
+        Ok(record) => {
+            println!(
+                "Started {}\nAppPort Application ID: {}\nAppBoundry Application ID: {}\nPID: {}\nEndpoint: {}",
+                record.name,
+                record
+                    .appport_application_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                record.application_id,
+                record.pid,
+                record.endpoint
+            );
+            Ok(())
+        }
+        Err(error) => {
+            child.kill().ok();
+            Err(error)
+        }
+    }
+}
+
 fn resolve_secrets(names: &[String]) -> Result<app_runtime::RuntimeSecrets, String> {
     let mut secrets = app_runtime::RuntimeSecrets::new();
     for name in names {
@@ -296,10 +401,43 @@ fn status(manifest: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
+fn appport_status(appport_manifest: &Path) -> Result<(), String> {
+    match app_runtime::appport_status(
+        appport_manifest,
+        Path::new("."),
+        None,
+        app_runtime::StateProviderKind::FeltDB,
+    )? {
+        app_runtime::ApplicationStatus::Running(record) => {
+            print_appport_record_status("running", &record);
+        }
+        app_runtime::ApplicationStatus::Stopped(prepared) => {
+            println!(
+                "AppPort Application ID: {}\nAppBoundry Application ID: {}\nExecution: stopped\nArtifact: verified\nState Provider: {}\nState Scope: {}\nEndpoint: {}",
+                prepared
+                    .appport_application_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                prepared.application_id,
+                appport_state_provider_label(prepared.state_provider),
+                prepared.application_id,
+                prepared.endpoint
+            );
+        }
+    }
+    Ok(())
+}
+
 fn stop(manifest: Option<&Path>) -> Result<(), String> {
     let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
     let record = app_runtime::stop(manifest_path)?;
     print_record_status("stopped", &record);
+    Ok(())
+}
+
+fn appport_stop(appport_manifest: &Path) -> Result<(), String> {
+    let record = app_runtime::appport_stop(appport_manifest)?;
+    print_appport_record_status("stopped", &record);
     Ok(())
 }
 
@@ -318,6 +456,31 @@ fn print_record_status(status: &str, record: &app_runtime::RuntimeRecord) {
         record.endpoint,
         record.state_provider.label(),
         record.application_id,
+        record.pid,
+        record.started_at,
+        record.artifact_path.display()
+    );
+}
+
+fn appport_state_provider_label(provider: app_runtime::StateProviderKind) -> &'static str {
+    match provider {
+        app_runtime::StateProviderKind::Filesystem => "filesystem",
+        app_runtime::StateProviderKind::FeltDB => "feltdb",
+    }
+}
+
+fn print_appport_record_status(status: &str, record: &app_runtime::RuntimeRecord) {
+    println!(
+        "AppPort Application ID: {}\nAppBoundry Application ID: {}\nExecution: {}\nArtifact: verified\nState Provider: {}\nState Scope: {}\nEndpoint: {}\nPID: {}\nStarted at: {}\nArtifact path: {}",
+        record
+            .appport_application_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        record.application_id,
+        status,
+        appport_state_provider_label(record.state_provider),
+        record.application_id,
+        record.endpoint,
         record.pid,
         record.started_at,
         record.artifact_path.display()

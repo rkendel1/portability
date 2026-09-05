@@ -95,6 +95,7 @@ impl StateProviderKind {
 #[derive(Debug)]
 pub struct PreparedApplication {
     pub application_id: ApplicationId,
+    pub appport_application_id: Option<String>,
     pub name: String,
     pub endpoint: String,
     pub state_provider: StateProviderKind,
@@ -105,6 +106,8 @@ pub struct PreparedApplication {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeRecord {
     pub application_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appport_application_id: Option<String>,
     pub name: String,
     pub pid: u32,
     pub endpoint: String,
@@ -173,6 +176,21 @@ pub fn run_manifest_with_state_provider_and_secrets(
     run_from_manifest(manifest_path, Path::new("."), state, provider, secrets)
 }
 
+pub fn run_appport_manifest_with_state_provider_and_secrets(
+    appport_manifest_path: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<(), String> {
+    run_from_appport_manifest(
+        appport_manifest_path,
+        Path::new("."),
+        state,
+        provider,
+        secrets,
+    )
+}
+
 pub fn invoke_appport_operation(
     appport_manifest_path: &Path,
     request_path: &Path,
@@ -180,13 +198,7 @@ pub fn invoke_appport_operation(
     provider: StateProviderKind,
     secrets: &RuntimeSecrets,
 ) -> Result<Value, String> {
-    let appport = serde_json::from_reader(fs::File::open(appport_manifest_path).map_err(|e| {
-        format!(
-            "cannot read AppPort manifest {}: {e}",
-            appport_manifest_path.display()
-        )
-    })?)
-    .map_err(|e| format!("invalid AppPort manifest: {e}"))?;
+    let appport = load_appport_manifest(appport_manifest_path)?;
     let request: Value = serde_json::from_reader(fs::File::open(request_path).map_err(|e| {
         format!(
             "cannot read AppPort request {}: {e}",
@@ -202,6 +214,25 @@ pub fn invoke_appport_operation(
         provider,
         secrets,
     )
+}
+
+fn load_appport_manifest(appport_manifest_path: &Path) -> Result<Value, String> {
+    serde_json::from_reader(fs::File::open(appport_manifest_path).map_err(|e| {
+        format!(
+            "cannot read AppPort manifest {}: {e}",
+            appport_manifest_path.display()
+        )
+    })?)
+    .map_err(|e| format!("invalid AppPort manifest: {e}"))
+}
+
+fn appport_manifest_dir(appport_manifest_path: &Path) -> Result<&Path, String> {
+    appport_manifest_path.parent().ok_or_else(|| {
+        format!(
+            "AppPort manifest path has no parent: {}",
+            appport_manifest_path.display()
+        )
+    })
 }
 
 pub fn invoke_appport_operation_value(
@@ -231,12 +262,7 @@ pub fn invoke_appport_operation_value(
         .get("version")
         .and_then(Value::as_u64)
         .ok_or("AppPort request capability.version must be an integer")?;
-    let manifest_dir = appport_manifest_path.parent().ok_or_else(|| {
-        format!(
-            "AppPort manifest path has no parent: {}",
-            appport_manifest_path.display()
-        )
-    })?;
+    let manifest_dir = appport_manifest_dir(appport_manifest_path)?;
     let artifact_file = app_manifest::appport_artifact_file(appport)?;
     let artifact_path = manifest_dir.join(&artifact_file);
     let wasm = fs::read(&artifact_path).map_err(|e| {
@@ -284,6 +310,27 @@ fn run_from_manifest(
     secrets: &RuntimeSecrets,
 ) -> Result<(), String> {
     let runtime = runtime_application(manifest_path, default_state_base, state, provider, secrets)?;
+    run_runtime_application(runtime)
+}
+
+fn run_from_appport_manifest(
+    appport_manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<(), String> {
+    let runtime = appport_runtime_application(
+        appport_manifest_path,
+        default_state_base,
+        state,
+        provider,
+        secrets,
+    )?;
+    run_runtime_application(runtime)
+}
+
+fn run_runtime_application(runtime: RuntimeApplication) -> Result<(), String> {
     let manifest = runtime.manifest;
     let wasm = runtime.wasm;
     let host_state = runtime.host_state;
@@ -338,9 +385,28 @@ pub fn prepare_start_with_secrets(
     Ok(runtime.prepared)
 }
 
+pub fn prepare_appport_start_with_secrets(
+    appport_manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<PreparedApplication, String> {
+    let runtime = appport_runtime_application(
+        appport_manifest_path,
+        default_state_base,
+        state,
+        provider,
+        secrets,
+    )?;
+    reject_if_running(&runtime.prepared.application_id)?;
+    Ok(runtime.prepared)
+}
+
 pub fn record_started(prepared: PreparedApplication, pid: u32) -> Result<RuntimeRecord, String> {
     let record = RuntimeRecord {
         application_id: prepared.application_id.to_string(),
+        appport_application_id: prepared.appport_application_id,
         name: prepared.name,
         pid,
         endpoint: prepared.endpoint,
@@ -401,8 +467,41 @@ pub fn status(
     }
 }
 
+pub fn appport_status(
+    appport_manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<ApplicationStatus, String> {
+    let prepared =
+        prepare_appport_status(appport_manifest_path, default_state_base, state, provider)?;
+    match read_record(prepared.application_id.as_str())? {
+        Some(record) if process_running(record.pid) => Ok(ApplicationStatus::Running(record)),
+        Some(_) => {
+            remove_record(prepared.application_id.as_str())?;
+            Ok(ApplicationStatus::Stopped(prepared))
+        }
+        None => Ok(ApplicationStatus::Stopped(prepared)),
+    }
+}
+
 pub fn stop(manifest_path: &Path) -> Result<RuntimeRecord, String> {
     let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let Some(record) = read_record(application_id.as_str())? else {
+        return Err(format!("application {application_id} is not running"));
+    };
+    if !process_running(record.pid) {
+        remove_record(application_id.as_str())?;
+        return Err(format!("application {application_id} is not running"));
+    }
+    terminate(record.pid)?;
+    remove_record(application_id.as_str())?;
+    Ok(record)
+}
+
+pub fn appport_stop(appport_manifest_path: &Path) -> Result<RuntimeRecord, String> {
+    let (manifest, wasm, _) = load_appport_manifest_artifact(appport_manifest_path)?;
     let application_id = manifest.application_id(&wasm)?;
     let Some(record) = read_record(application_id.as_str())? else {
         return Err(format!("application {application_id} is not running"));
@@ -458,6 +557,10 @@ fn runtime_application(
         .as_ref()
         .ok_or("no HTTP endpoint declared")?
         .listen;
+    let appport_application_id = manifest
+        .appport
+        .as_ref()
+        .map(|appport| appport.application_id.clone());
     let name = manifest.name.clone();
     Ok(RuntimeApplication {
         manifest,
@@ -465,11 +568,70 @@ fn runtime_application(
         host_state,
         prepared: PreparedApplication {
             application_id,
+            appport_application_id,
             name,
             endpoint: format!("http://127.0.0.1:{listen}"),
             state_provider: provider,
             state_location,
             artifact_path: artifact_path(manifest_path)?,
+        },
+    })
+}
+
+fn appport_runtime_application(
+    appport_manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<RuntimeApplication, String> {
+    let (manifest, wasm, artifact_path) = load_appport_manifest_artifact(appport_manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let state_location = manifest
+        .storage
+        .as_ref()
+        .map(|storage| {
+            state_root(
+                default_state_base,
+                state,
+                provider,
+                &storage.path,
+                application_id.as_str(),
+            )
+        })
+        .transpose()?;
+    let host_state = host_state(
+        default_state_base,
+        state,
+        provider,
+        application_id.as_str(),
+        &manifest,
+        secrets,
+    )?;
+    let listen = manifest
+        .http
+        .as_ref()
+        .ok_or("no HTTP endpoint declared")?
+        .listen;
+    let appport_application_id = manifest
+        .appport
+        .as_ref()
+        .map(|appport| appport.application_id.clone());
+    let name = manifest.name.clone();
+    Ok(RuntimeApplication {
+        manifest,
+        wasm,
+        host_state,
+        prepared: PreparedApplication {
+            application_id,
+            appport_application_id,
+            name,
+            endpoint: format!("http://127.0.0.1:{listen}"),
+            state_provider: provider,
+            state_location,
+            artifact_path: artifact_path
+                .canonicalize()
+                .unwrap_or_else(|_| artifact_path.to_path_buf()),
         },
     })
 }
@@ -502,11 +664,55 @@ fn prepare_status(
         .listen;
     Ok(PreparedApplication {
         application_id,
+        appport_application_id: manifest
+            .appport
+            .as_ref()
+            .map(|appport| appport.application_id.clone()),
         name: manifest.name,
         endpoint: format!("http://127.0.0.1:{listen}"),
         state_provider: provider,
         state_location,
         artifact_path: artifact_path(manifest_path)?,
+    })
+}
+
+fn prepare_appport_status(
+    appport_manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<PreparedApplication, String> {
+    let (manifest, wasm, artifact_path) = load_appport_manifest_artifact(appport_manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let state_location = manifest
+        .storage
+        .as_ref()
+        .map(|storage| {
+            state_root(
+                default_state_base,
+                state,
+                provider,
+                &storage.path,
+                application_id.as_str(),
+            )
+        })
+        .transpose()?;
+    let listen = manifest
+        .http
+        .as_ref()
+        .ok_or("no HTTP endpoint declared")?
+        .listen;
+    Ok(PreparedApplication {
+        appport_application_id: manifest
+            .appport
+            .as_ref()
+            .map(|appport| appport.application_id.clone()),
+        application_id,
+        name: manifest.name,
+        endpoint: format!("http://127.0.0.1:{listen}"),
+        state_provider: provider,
+        state_location,
+        artifact_path,
     })
 }
 
@@ -519,6 +725,31 @@ fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), S
         return Err("artifact hash mismatch".into());
     }
     Ok((manifest, wasm))
+}
+
+fn load_appport_manifest_artifact(
+    appport_manifest_path: &Path,
+) -> Result<(Manifest, Vec<u8>, PathBuf), String> {
+    let appport = load_appport_manifest(appport_manifest_path)?;
+    let manifest_dir = appport_manifest_dir(appport_manifest_path)?;
+    let artifact_file = app_manifest::appport_artifact_file(&appport)?;
+    let artifact_path = manifest_dir.join(&artifact_file);
+    let wasm = fs::read(&artifact_path).map_err(|e| {
+        format!(
+            "cannot read AppPort artifact {}: {e}",
+            artifact_path.display()
+        )
+    })?;
+    let operation = app_manifest::appport_lifecycle_operation(&appport)?;
+    let manifest =
+        Manifest::from_appport_operation(&appport, &operation.name, operation.version, &wasm)?;
+    Ok((
+        manifest,
+        wasm,
+        artifact_path
+            .canonicalize()
+            .unwrap_or_else(|_| artifact_path.to_path_buf()),
+    ))
 }
 
 fn artifact_path(manifest_path: &Path) -> Result<PathBuf, String> {
@@ -576,6 +807,13 @@ fn host_state(
         .as_ref()
         .map(|network| network.outbound.as_slice())
         .unwrap_or(&[]);
+    let log_path = std::env::var_os("APP_RUNTIME_LOG")
+        .map(PathBuf::from)
+        .or_else(|| log_path(application_id).ok());
+    let initial_execution_unit = log_path
+        .as_ref()
+        .map(|path| highest_logged_execution_unit(path, application_id))
+        .unwrap_or(0);
     Ok(HostState {
         application_id: application_id.to_string(),
         network: NetworkCapability::with_destinations(manifest.capabilities.network, destinations),
@@ -587,11 +825,23 @@ fn host_state(
         limits: store_limits,
         execution_fuel,
         requests: RequestLimiter::new(request_limit),
-        execution_units: Arc::new(AtomicUsize::new(0)),
-        log_path: std::env::var_os("APP_RUNTIME_LOG")
-            .map(PathBuf::from)
-            .or_else(|| log_path(application_id).ok()),
+        execution_units: Arc::new(AtomicUsize::new(initial_execution_unit)),
+        log_path,
     })
+}
+
+fn highest_logged_execution_unit(path: &Path, application_id: &str) -> usize {
+    let Ok(logs) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let prefix = format!("execution-unit {application_id}#");
+    logs.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(&prefix)?;
+            rest.split_once(' ')?.0.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn runtime_config(allowed: &[String]) -> RuntimeConfig {
