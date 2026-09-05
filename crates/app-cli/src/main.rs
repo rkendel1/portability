@@ -51,6 +51,17 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         secret: Vec<String>,
     },
+    #[command(name = "appport-invoke")]
+    AppPortInvoke {
+        appport_manifest: PathBuf,
+        request: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
+        state_provider: StateProvider,
+        #[arg(long, value_name = "NAME")]
+        secret: Vec<String>,
+    },
     Start {
         manifest: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
@@ -105,6 +116,23 @@ fn main() {
                 state_provider.into(),
                 &secrets,
             ),
+        }),
+        Command::AppPortInvoke {
+            appport_manifest,
+            request,
+            state,
+            state_provider,
+            secret,
+        } => resolve_secrets(&secret).and_then(|secrets| {
+            let response = app_runtime::invoke_appport_operation(
+                &appport_manifest,
+                &request,
+                state.as_deref(),
+                state_provider.into(),
+                &secrets,
+            )?;
+            println!("{response}");
+            Ok(())
         }),
         Command::Start {
             manifest,

@@ -4,6 +4,7 @@ use app_capabilities::{
 };
 use app_manifest::{ApplicationId, Manifest, sha256};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -170,6 +171,109 @@ pub fn run_manifest_with_state_provider_and_secrets(
     secrets: &RuntimeSecrets,
 ) -> Result<(), String> {
     run_from_manifest(manifest_path, Path::new("."), state, provider, secrets)
+}
+
+pub fn invoke_appport_operation(
+    appport_manifest_path: &Path,
+    request_path: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<Value, String> {
+    let appport = serde_json::from_reader(fs::File::open(appport_manifest_path).map_err(|e| {
+        format!(
+            "cannot read AppPort manifest {}: {e}",
+            appport_manifest_path.display()
+        )
+    })?)
+    .map_err(|e| format!("invalid AppPort manifest: {e}"))?;
+    let request: Value = serde_json::from_reader(fs::File::open(request_path).map_err(|e| {
+        format!(
+            "cannot read AppPort request {}: {e}",
+            request_path.display()
+        )
+    })?)
+    .map_err(|e| format!("invalid AppPort request: {e}"))?;
+    invoke_appport_operation_value(
+        appport_manifest_path,
+        &appport,
+        &request,
+        state,
+        provider,
+        secrets,
+    )
+}
+
+pub fn invoke_appport_operation_value(
+    appport_manifest_path: &Path,
+    appport: &Value,
+    request: &Value,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+    secrets: &RuntimeSecrets,
+) -> Result<Value, String> {
+    let request_id = request
+        .get("requestId")
+        .and_then(Value::as_str)
+        .ok_or("AppPort request requires requestId")?;
+    if request.get("type").and_then(Value::as_str) != Some("request") {
+        return Err("AppPort operation invocation requires a request envelope".into());
+    }
+    let capability = request
+        .get("capability")
+        .and_then(Value::as_object)
+        .ok_or("AppPort request requires capability")?;
+    let operation_name = capability
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("AppPort request capability.name must be a string")?;
+    let operation_version = capability
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or("AppPort request capability.version must be an integer")?;
+    let manifest_dir = appport_manifest_path.parent().ok_or_else(|| {
+        format!(
+            "AppPort manifest path has no parent: {}",
+            appport_manifest_path.display()
+        )
+    })?;
+    let artifact_file = app_manifest::appport_artifact_file(appport)?;
+    let artifact_path = manifest_dir.join(&artifact_file);
+    let wasm = fs::read(&artifact_path).map_err(|e| {
+        format!(
+            "cannot read AppPort artifact {}: {e}",
+            artifact_path.display()
+        )
+    })?;
+    let manifest =
+        Manifest::from_appport_operation(appport, operation_name, operation_version, &wasm)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let host_state = host_state(
+        manifest_dir,
+        state,
+        provider,
+        application_id.as_str(),
+        &manifest,
+        secrets,
+    )?;
+    let engine = engine(host_state.execution_fuel.is_some())?;
+    let module = Module::new(&engine, &wasm).map_err(|e| e.to_string())?;
+    invoke(&engine, &module, host_state)?;
+    let mut response = json!({
+        "protocol": request
+            .get("protocol")
+            .or_else(|| appport.get("protocol"))
+            .cloned()
+            .unwrap_or_else(|| json!("appport/1")),
+        "type": "response",
+        "requestId": request_id,
+        "ok": true,
+        "output": null
+    });
+    if let Some(trace_id) = request.get("traceId").cloned() {
+        response["traceId"] = trace_id;
+    }
+    Ok(response)
 }
 
 fn run_from_manifest(
@@ -1236,6 +1340,7 @@ mod tests {
         Manifest {
             name: "hello".into(),
             version: "0.1.0".into(),
+            appport: None,
             runtime: "wasm".into(),
             artifact: app_manifest::Artifact {
                 file: "app.wasm".into(),
