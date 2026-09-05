@@ -131,23 +131,19 @@ impl StorageCapability {
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, CapabilityError> {
-        fs::read(self.resolve(path, "read")?).map_err(|e| CapabilityError::Host(e.to_string()))
+        self.provider
+            .read(&self.resolve(path, "read")?)
+            .map_err(CapabilityError::Host)
     }
 
     pub fn write(&self, path: &str, value: &[u8]) -> Result<(), CapabilityError> {
-        let path = self.resolve(path, "write")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| CapabilityError::Host(e.to_string()))?;
-        }
-        fs::write(path, value).map_err(|e| CapabilityError::Host(e.to_string()))
+        self.provider
+            .write(&self.resolve(path, "write")?, value)
+            .map_err(CapabilityError::Host)
     }
 
-    fn resolve(
-        &self,
-        requested: &str,
-        operation: &'static str,
-    ) -> Result<PathBuf, CapabilityError> {
-        resolve_storage_path(&self.mount, requested, &self.provider.root).map_err(|_| {
+    fn resolve(&self, requested: &str, operation: &'static str) -> Result<String, CapabilityError> {
+        storage_relative_path(&self.mount, requested).map_err(|_| {
             CapabilityError::CapabilityDenied {
                 capability: "filesystem",
                 operation,
@@ -167,13 +163,27 @@ pub fn resolve_storage_path(
     requested: &str,
     host_root: &Path,
 ) -> Result<PathBuf, String> {
+    let relative = storage_relative_path(mount, requested)?;
+    resolve_relative_path(&relative, host_root)
+}
+
+fn storage_relative_path(mount: &str, requested: &str) -> Result<String, String> {
     let relative = requested
         .strip_prefix(mount)
         .ok_or_else(|| "requested path is outside declared storage mount".to_string())?;
     if !relative.is_empty() && !relative.starts_with('/') {
         return Err("requested path is outside declared storage mount".into());
     }
-    resolve_relative_path(relative.trim_start_matches('/'), host_root)
+    let relative = relative.trim_start_matches('/');
+    for component in Path::new(relative).components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err("requested path is outside declared storage mount".into());
+        }
+    }
+    Ok(relative.into())
 }
 
 fn resolve_relative_path(path: &str, host_root: &Path) -> Result<PathBuf, String> {

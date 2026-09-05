@@ -3,7 +3,7 @@ use app_manifest::{Manifest, sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use wasmtime::{Caller, Engine, Linker, Module, Store};
 
 #[derive(Clone)]
@@ -13,19 +13,24 @@ struct HostState {
 }
 
 pub fn run(project: &Path) -> Result<(), String> {
-    run_from_manifest(&project.join("target/app.manifest.json"), project)
+    run_with_state(project, None)
 }
 
-pub fn run_manifest(manifest_path: &Path) -> Result<(), String> {
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
-    run_from_manifest(manifest_path, manifest_dir)
+pub fn run_with_state(project: &Path, state: Option<&Path>) -> Result<(), String> {
+    run_from_manifest(&project.join("target/app.manifest.json"), project, state)
 }
 
-fn run_from_manifest(manifest_path: &Path, storage_base: &Path) -> Result<(), String> {
+pub fn run_manifest(manifest_path: &Path, state: Option<&Path>) -> Result<(), String> {
+    run_from_manifest(manifest_path, Path::new("."), state)
+}
+
+fn run_from_manifest(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+) -> Result<(), String> {
     let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
-    let host_state = host_state(storage_base, &manifest)?;
+    let host_state = host_state(default_state_base, state, &manifest)?;
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
     let http = manifest.http.ok_or("no HTTP endpoint declared")?;
@@ -58,12 +63,18 @@ fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), S
     Ok((manifest, wasm))
 }
 
-fn host_state(storage_base: &Path, manifest: &Manifest) -> Result<HostState, String> {
+fn host_state(
+    default_state_base: &Path,
+    state: Option<&Path>,
+    manifest: &Manifest,
+) -> Result<HostState, String> {
     let storage = match (&manifest.storage, manifest.capabilities.filesystem) {
-        (Some(storage), true) => Some(StorageCapability::new(
-            &storage.mount,
-            storage_base.join(&storage.path),
-        )?),
+        (Some(storage), true) => {
+            let state_root = state
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_state_base.join(&storage.path));
+            Some(StorageCapability::new(&storage.mount, state_root)?)
+        }
         (None, false) => None,
         (None, true) => return Err("filesystem capability requires storage declaration".into()),
         (Some(_), false) => return Err("storage declaration requires filesystem capability".into()),
@@ -376,6 +387,28 @@ mod tests {
         }
     }
 
+    fn manifest() -> Manifest {
+        Manifest {
+            name: "hello".into(),
+            version: "0.1.0".into(),
+            runtime: "wasm".into(),
+            artifact: app_manifest::Artifact {
+                file: "app.wasm".into(),
+                sha256: sha256(b"wasm"),
+                size: 4,
+            },
+            http: Some(app_manifest::HttpCapability { listen: 8080 }),
+            capabilities: app_manifest::ManifestCapabilities {
+                network: false,
+                filesystem: true,
+            },
+            storage: Some(app_manifest::Storage {
+                mount: "/data".into(),
+                path: ".app/data".into(),
+            }),
+        }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -466,6 +499,40 @@ mod tests {
         let error = load_manifest_artifact(&tempdir.join("app.manifest.json")).unwrap_err();
 
         assert_eq!(error, "artifact hash mismatch");
+    }
+
+    #[test]
+    fn explicit_state_directory_is_storage_root() {
+        let project = temp_path("project-default-state");
+        let state = temp_path("explicit-state");
+        let storage = super::host_state(&project, Some(&state), &manifest())
+            .unwrap()
+            .storage
+            .unwrap();
+
+        storage.write("/data/counter", b"explicit").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(state.join("counter")).unwrap(),
+            "explicit"
+        );
+        assert!(!project.join(".app/data/counter").exists());
+    }
+
+    #[test]
+    fn default_state_directory_is_relative_to_runtime_context() {
+        let project = temp_path("default-state");
+        let storage = super::host_state(&project, None, &manifest())
+            .unwrap()
+            .storage
+            .unwrap();
+
+        storage.write("/data/counter", b"default").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.join(".app/data/counter")).unwrap(),
+            "default"
+        );
     }
 
     #[test]

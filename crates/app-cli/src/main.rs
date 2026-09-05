@@ -10,10 +10,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Init { name: String },
+    Init {
+        name: String,
+    },
     Build,
-    Run { manifest: Option<PathBuf> },
-    Inspect { manifest: Option<PathBuf> },
+    Run {
+        manifest: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+    },
+    Inspect {
+        manifest: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -29,9 +37,9 @@ fn main() {
             );
             Ok(())
         }),
-        Command::Run { manifest } => match manifest {
-            Some(manifest) => app_runtime::run_manifest(&manifest),
-            None => app_runtime::run(Path::new(".")),
+        Command::Run { manifest, state } => match manifest {
+            Some(manifest) => app_runtime::run_manifest(&manifest, state.as_deref()),
+            None => app_runtime::run_with_state(Path::new("."), state.as_deref()),
         },
         Command::Inspect { manifest } => match manifest {
             Some(manifest) => inspect(&manifest),

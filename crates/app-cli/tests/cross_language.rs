@@ -53,16 +53,36 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         );
         assert_eq!(application_id(&relocated_inspect), built_id);
 
-        let mut portable =
-            run_app_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
+        let state_a = temp_project(&format!("{example}-state-a"));
+        let state_b = temp_project(&format!("{example}-state-b"));
+
+        let mut portable = run_app_manifest_with_state(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &state_a,
+        );
         wait_for_listen(port, &mut portable);
         assert!(http_get(port, "/").contains("Hello from WASM"));
         portable.kill().ok();
         portable.wait().ok();
-        assert_eq!(
-            fs::read_to_string(artifact.join(".app/data/counter")).unwrap(),
-            "1"
+        assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
+        assert!(!artifact.join(".app/data/counter").exists());
+
+        let relocated_inspect_again =
+            inspect_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
+        assert_eq!(application_id(&relocated_inspect_again), built_id);
+        let mut portable = run_app_manifest_with_state(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &state_b,
         );
+        wait_for_listen(port, &mut portable);
+        assert!(http_get(port, "/").contains("Hello from WASM"));
+        portable.kill().ok();
+        portable.wait().ok();
+        assert_eq!(fs::read_to_string(state_b.join("counter")).unwrap(), "1");
+        assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
+        assert!(!artifact.join(".app/data/counter").exists());
 
         let mut first = run_app(&project);
         wait_for_listen(port, &mut first);
@@ -303,10 +323,12 @@ fn run_app(project: &Path) -> Child {
         .unwrap()
 }
 
-fn run_app_manifest(cwd: &Path, manifest: &Path) -> Child {
+fn run_app_manifest_with_state(cwd: &Path, manifest: &Path, state: &Path) -> Child {
     app(cwd)
         .arg("run")
         .arg(manifest)
+        .arg("--state")
+        .arg(state)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
