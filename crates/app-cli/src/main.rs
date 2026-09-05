@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "app", about = "Daemonless WASM application runtime")]
@@ -46,6 +49,19 @@ enum Command {
         #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
         state_provider: StateProvider,
     },
+    Start {
+        manifest: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        state: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = StateProvider::FeltDB)]
+        state_provider: StateProvider,
+    },
+    Status {
+        manifest: Option<PathBuf>,
+    },
+    Stop {
+        manifest: Option<PathBuf>,
+    },
     Inspect {
         manifest: Option<PathBuf>,
     },
@@ -80,6 +96,13 @@ fn main() {
                 state_provider.into(),
             ),
         },
+        Command::Start {
+            manifest,
+            state,
+            state_provider,
+        } => start(manifest.as_deref(), state.as_deref(), state_provider),
+        Command::Status { manifest } => status(manifest.as_deref()),
+        Command::Stop { manifest } => stop(manifest.as_deref()),
         Command::Inspect { manifest } => match manifest {
             Some(manifest) => inspect(&manifest),
             None => inspect(Path::new("target/app.manifest.json")),
@@ -113,6 +136,118 @@ fn init(name: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     println!("Created {}", root.display());
     Ok(())
+}
+
+fn start(
+    manifest: Option<&Path>,
+    state: Option<&Path>,
+    state_provider: StateProvider,
+) -> Result<(), String> {
+    let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
+    let prepared =
+        app_runtime::prepare_start(manifest_path, Path::new("."), state, state_provider.into())?;
+    let mut command =
+        std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    command.arg("run");
+    if let Some(manifest) = manifest {
+        command.arg(manifest);
+    }
+    if let Some(state) = state {
+        command.arg("--state").arg(state);
+    }
+    command
+        .arg("--state-provider")
+        .arg(state_provider.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    wait_for_started(&mut child, &prepared.endpoint)?;
+    match app_runtime::record_started(prepared, child.id()) {
+        Ok(record) => {
+            println!(
+                "Started {}\nApplication ID: {}\nPID: {}\nEndpoint: {}",
+                record.name, record.application_id, record.pid, record.endpoint
+            );
+            Ok(())
+        }
+        Err(error) => {
+            child.kill().ok();
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_started(child: &mut std::process::Child, endpoint: &str) -> Result<(), String> {
+    let stdout = child.stdout.take().ok_or("cannot read app start output")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        tx.send(result).ok();
+    });
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(line)) if line.contains(&format!("listening on {endpoint}")) => Ok(()),
+        Ok(Ok(line)) => {
+            child.kill().ok();
+            Err(format!("unexpected app start output: {line}"))
+        }
+        Ok(Err(error)) => {
+            child.kill().ok();
+            Err(format!("failed to read app start output: {error}"))
+        }
+        Err(_) => {
+            child.kill().ok();
+            Err(format!("timed out waiting for app to listen on {endpoint}"))
+        }
+    }
+}
+
+fn status(manifest: Option<&Path>) -> Result<(), String> {
+    let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
+    match app_runtime::status(
+        manifest_path,
+        Path::new("."),
+        None,
+        app_runtime::StateProviderKind::FeltDB,
+    )? {
+        app_runtime::ApplicationStatus::Running(record) => {
+            print_record_status("running", &record);
+        }
+        app_runtime::ApplicationStatus::Stopped(prepared) => {
+            println!(
+                "Application: {}\nApplication ID: {}\nStatus:       stopped\nEndpoint:     {}\nState:        {}\nState scope:  {}\nArtifact:     verified",
+                prepared.name,
+                prepared.application_id,
+                prepared.endpoint,
+                prepared.state_provider.label(),
+                prepared.application_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn stop(manifest: Option<&Path>) -> Result<(), String> {
+    let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
+    let record = app_runtime::stop(manifest_path)?;
+    print_record_status("stopped", &record);
+    Ok(())
+}
+
+fn print_record_status(status: &str, record: &app_runtime::RuntimeRecord) {
+    println!(
+        "Application: {}\nApplication ID: {}\nStatus:       {}\nEndpoint:     {}\nState:        {}\nState scope:  {}\nArtifact:     verified\nPID:          {}\nStarted at:   {}\nArtifact path: {}",
+        record.name,
+        record.application_id,
+        status,
+        record.endpoint,
+        record.state_provider.label(),
+        record.application_id,
+        record.pid,
+        record.started_at,
+        record.artifact_path.display()
+    );
 }
 
 fn inspect(manifest_path: &Path) -> Result<(), String> {
