@@ -57,6 +57,8 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         let state_b = temp_project(&format!("{example}-state-b"));
         let feltdb_state_a = temp_project(&format!("{example}-feltdb-state-a"));
         let feltdb_state_b = temp_project(&format!("{example}-feltdb-state-b"));
+        let default_home = temp_project(&format!("{example}-default-home"));
+        let default_feltdb_state = default_feltdb_state(&default_home, built_id);
 
         let mut portable = run_app_manifest_with_state(
             &std::env::temp_dir(),
@@ -124,23 +126,33 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
 
-        let mut first = run_app(&project);
+        let mut first = run_app_manifest_with_home(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &default_home,
+        );
         wait_for_listen(port, &mut first);
         assert!(http_get(port, "/").contains("Hello from WASM"));
         stop_app(port, first);
         assert_eq!(
-            fs::read_to_string(project.join(".app/data/counter")).unwrap(),
-            "1"
+            felt_state(&default_feltdb_state, built_id, "counter"),
+            "MQ=="
         );
+        assert!(!artifact.join(".app/data/counter").exists());
 
-        let mut second = run_app(&project);
+        let mut second = run_app_manifest_with_home(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &default_home,
+        );
         wait_for_listen(port, &mut second);
         assert!(http_get(port, "/").contains("Hello from WASM"));
         stop_app(port, second);
         assert_eq!(
-            fs::read_to_string(project.join(".app/data/counter")).unwrap(),
-            "1"
+            felt_state(&default_feltdb_state, built_id, "counter"),
+            "MQ=="
         );
+        assert!(!artifact.join(".app/data/counter").exists());
     }
 
     assert!(
@@ -359,6 +371,27 @@ fn run_app(project: &Path) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+fn run_app_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> Child {
+    app(cwd)
+        .arg("run")
+        .arg(manifest)
+        .env("HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn default_feltdb_state(home: &Path, application_id: &str) -> std::path::PathBuf {
+    let mut path = home.join(".appboundry").join("state");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path
 }
 
 fn run_app_manifest_with_state(cwd: &Path, manifest: &Path, state: &Path) -> Child {
