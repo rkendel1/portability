@@ -9,30 +9,23 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub runtime: String,
-    pub build: Build,
     pub artifact: Artifact,
+    pub http: Option<HttpCapability>,
     pub capabilities: ManifestCapabilities,
-    pub state: Option<State>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Build {
-    pub language: String,
-    pub target: String,
+    pub storage: Option<Storage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Artifact {
-    pub path: String,
+    pub file: String,
     pub sha256: String,
     pub size: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestCapabilities {
-    pub http: Option<HttpCapability>,
     pub network: bool,
-    pub filesystem: Vec<String>,
+    pub filesystem: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,9 +34,9 @@ pub struct HttpCapability {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct State {
-    pub provider: String,
+pub struct Storage {
     pub mount: String,
+    #[serde(default = "default_storage_path")]
     pub path: String,
 }
 
@@ -54,32 +47,20 @@ impl Manifest {
             name: spec.name.clone(),
             version: spec.version.clone(),
             runtime: spec.runtime.kind.clone(),
-            build: Build {
-                language: spec.build.language.clone(),
-                target: spec.build.target.clone(),
-            },
             artifact: Artifact {
-                path: "app.wasm".into(),
+                file: "app.wasm".into(),
                 sha256,
                 size: bytes.len() as u64,
             },
+            http: spec
+                .http
+                .as_ref()
+                .map(|h| HttpCapability { listen: h.listen }),
             capabilities: ManifestCapabilities {
-                http: spec
-                    .http
-                    .as_ref()
-                    .map(|h| HttpCapability { listen: h.listen }),
                 network: spec.capabilities.network,
-                filesystem: if spec.capabilities.filesystem {
-                    spec.storage
-                        .as_ref()
-                        .map(|s| vec![s.mount.clone()])
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                },
+                filesystem: spec.capabilities.filesystem,
             },
-            state: spec.storage.as_ref().map(|s| State {
-                provider: "local".into(),
+            storage: spec.storage.as_ref().map(|s| Storage {
                 mount: s.mount.clone(),
                 path: s.path.clone(),
             }),
@@ -111,11 +92,43 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn default_storage_path() -> String {
+    ".app/data".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn artifact_hash_is_deterministic() {
         assert_eq!(sha256(b"same"), sha256(b"same"));
+    }
+
+    #[test]
+    fn storage_path_defaults_for_minimal_artifact_manifest() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"
+{
+  "name": "hello",
+  "version": "0.1.0",
+  "runtime": "wasm",
+  "artifact": {
+    "file": "app.wasm",
+    "sha256": "abc",
+    "size": 1
+  },
+  "capabilities": {
+    "network": false,
+    "filesystem": true
+  },
+  "storage": {
+    "mount": "/data"
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.storage.unwrap().path, ".app/data");
     }
 }

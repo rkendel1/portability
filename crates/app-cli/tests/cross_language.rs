@@ -26,6 +26,27 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         app(&project).arg("build").assert_success();
         assert!(project.join("target/app.wasm").is_file());
         assert!(project.join("target/app.manifest.json").is_file());
+        let manifest = fs::read_to_string(project.join("target/app.manifest.json")).unwrap();
+        assert!(manifest.contains(r#""file": "app.wasm""#), "{manifest}");
+
+        let artifact = temp_project(&format!("{example}-artifact"));
+        fs::copy(project.join("target/app.wasm"), artifact.join("app.wasm")).unwrap();
+        fs::copy(
+            project.join("target/app.manifest.json"),
+            artifact.join("app.manifest.json"),
+        )
+        .unwrap();
+
+        let mut portable =
+            run_app_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
+        wait_for_listen(port, &mut portable);
+        assert!(http_get(port, "/").contains("Hello from WASM"));
+        portable.kill().ok();
+        portable.wait().ok();
+        assert_eq!(
+            fs::read_to_string(artifact.join(".app/data/counter")).unwrap(),
+            "1"
+        );
 
         let mut first = run_app(&project);
         wait_for_listen(port, &mut first);
@@ -232,6 +253,16 @@ fn free_port() -> u16 {
 fn run_app(project: &Path) -> Child {
     app(project)
         .arg("run")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn run_app_manifest(cwd: &Path, manifest: &Path) -> Child {
+    app(cwd)
+        .arg("run")
+        .arg(manifest)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

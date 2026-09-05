@@ -12,8 +12,8 @@ struct Cli {
 enum Command {
     Init { name: String },
     Build,
-    Run,
-    Inspect,
+    Run { manifest: Option<PathBuf> },
+    Inspect { manifest: Option<PathBuf> },
 }
 
 fn main() {
@@ -25,8 +25,14 @@ fn main() {
                 m.name, m.artifact.sha256
             )
         }),
-        Command::Run => app_runtime::run(Path::new(".")),
-        Command::Inspect => inspect(Path::new(".")),
+        Command::Run { manifest } => match manifest {
+            Some(manifest) => app_runtime::run_manifest(&manifest),
+            None => app_runtime::run(Path::new(".")),
+        },
+        Command::Inspect { manifest } => match manifest {
+            Some(manifest) => inspect(&manifest),
+            None => inspect(Path::new("target/app.manifest.json")),
+        },
     };
     if let Err(error) = result {
         eprintln!("ERROR {error}");
@@ -58,17 +64,17 @@ fn init(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn inspect(project: &Path) -> Result<(), String> {
-    let manifest = app_manifest::Manifest::load(&project.join("target/app.manifest.json"))?;
+fn inspect(manifest_path: &Path) -> Result<(), String> {
+    let manifest = app_manifest::Manifest::load(manifest_path)?;
     println!(
-        "Application: {}\nVersion:     {}\nRuntime:     {}\nArtifact:\n  SHA256:    {}\n  Size:      {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nState:\n  durable:   {}",
+        "Application: {}\nVersion:     {}\nRuntime:     {}\nArtifact:\n  File:      {}\n  SHA256:    {}\n  Size:      {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nStorage:\n  mount:     {}\n  path:      {}",
         manifest.name,
         manifest.version,
         manifest.runtime,
+        manifest.artifact.file,
         manifest.artifact.sha256,
         manifest.artifact.size,
         manifest
-            .capabilities
             .http
             .map(|h| format!("listen :{}", h.listen))
             .unwrap_or_else(|| "none".into()),
@@ -77,16 +83,17 @@ fn inspect(project: &Path) -> Result<(), String> {
         } else {
             "denied"
         },
-        if manifest.capabilities.filesystem.is_empty() {
-            "none".into()
-        } else {
-            manifest.capabilities.filesystem.join(", ")
-        },
-        if manifest.state.is_some() {
-            "yes"
-        } else {
-            "no"
-        }
+        manifest.capabilities.filesystem,
+        manifest
+            .storage
+            .as_ref()
+            .map(|storage| storage.mount.as_str())
+            .unwrap_or("none"),
+        manifest
+            .storage
+            .as_ref()
+            .map(|storage| storage.path.as_str())
+            .unwrap_or("none")
     );
     Ok(())
 }
