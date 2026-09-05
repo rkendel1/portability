@@ -66,6 +66,9 @@ enum Command {
     Stop {
         manifest: Option<PathBuf>,
     },
+    Logs {
+        manifest: Option<PathBuf>,
+    },
     Inspect {
         manifest: Option<PathBuf>,
     },
@@ -116,6 +119,7 @@ fn main() {
         ),
         Command::Status { manifest } => status(manifest.as_deref()),
         Command::Stop { manifest } => stop(manifest.as_deref()),
+        Command::Logs { manifest } => logs(manifest.as_deref()),
         Command::Inspect { manifest } => match manifest {
             Some(manifest) => inspect(&manifest),
             None => inspect(Path::new("target/app.manifest.json")),
@@ -140,7 +144,7 @@ fn init(name: &str) -> Result<(), String> {
         return Err(format!("{} already exists", root.display()));
     }
     fs::create_dir_all(root.join("src")).map_err(|e| e.to_string())?;
-    fs::write(root.join("app.toml"), format!("name = \"{name}\"\nversion = \"0.1.0\"\n[build]\nsource = \"src\"\nentry = \"src/main.rs\"\n[runtime]\nkind = \"wasm\"\n[http]\nlisten = 8080\n[capabilities]\nnetwork = false\nfilesystem = true\n[storage]\npath = \".app/data\"\nmount = \"/data\"\n")).map_err(|e| e.to_string())?;
+    fs::write(root.join("app.toml"), format!("name = \"{name}\"\nversion = \"0.1.0\"\n[build]\nsource = \"src\"\nentry = \"src/main.rs\"\n[runtime]\nkind = \"wasm\"\n[http]\nlisten = 8080\n[capabilities]\nnetwork = false\nfilesystem = true\n[resources]\nmemory_mb = 256\ntimeout_ms = 30000\n[storage]\npath = \".app/data\"\nmount = \"/data\"\n")).map_err(|e| e.to_string())?;
     fs::write(root.join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nautobins = false\n\n[lib]\npath = \"src/main.rs\"\ncrate-type = [\"cdylib\"]\n")).map_err(|e| e.to_string())?;
     fs::write(
         root.join("src/main.rs"),
@@ -185,6 +189,8 @@ fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    let log_path = app_runtime::log_path_for_application_id(&prepared.application_id)?;
+    command.env("APP_RUNTIME_LOG", &log_path);
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     wait_for_started(&mut child, &prepared.endpoint)?;
     match app_runtime::record_started(prepared, child.id()) {
@@ -269,6 +275,12 @@ fn stop(manifest: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
+fn logs(manifest: Option<&Path>) -> Result<(), String> {
+    let manifest_path = manifest.unwrap_or(Path::new("target/app.manifest.json"));
+    print!("{}", app_runtime::logs(manifest_path)?);
+    Ok(())
+}
+
 fn print_record_status(status: &str, record: &app_runtime::RuntimeRecord) {
     println!(
         "Application: {}\nApplication ID: {}\nStatus:       {}\nEndpoint:     {}\nState:        {}\nState scope:  {}\nArtifact:     verified\nPID:          {}\nStarted at:   {}\nArtifact path: {}",
@@ -299,7 +311,7 @@ fn inspect(manifest_path: &Path) -> Result<(), String> {
         "mismatch"
     };
     println!(
-        "Application: {}\nVersion:     {}\nRuntime:     {}\nApplication ID:\n  {}\nArtifact:\n  File:      {}\n  SHA256:    {}\n  Size:      {}\n  Integrity: {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nStorage:\n  mount:     {}\n  path:      {}",
+        "Application: {}\nVersion:     {}\nRuntime:     {}\nApplication ID:\n  {}\nArtifact:\n  File:      {}\n  SHA256:    {}\n  Size:      {}\n  Integrity: {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nConfig:\n  allowed:   {}\nNetwork:\n  outbound:  {}\nResources:\n  memory_mb: {}\n  timeout_ms: {}\n  concurrency: {}\nStorage:\n  mount:     {}\n  path:      {}",
         manifest.name,
         manifest.version,
         manifest.runtime,
@@ -318,6 +330,32 @@ fn inspect(manifest_path: &Path) -> Result<(), String> {
             "denied"
         },
         manifest.capabilities.filesystem,
+        if manifest.config.allowed.is_empty() {
+            "none".into()
+        } else {
+            manifest.config.allowed.join(", ")
+        },
+        manifest
+            .network
+            .as_ref()
+            .filter(|network| !network.outbound.is_empty())
+            .map(|network| network.outbound.join(", "))
+            .unwrap_or_else(|| "runtime policy".into()),
+        manifest
+            .resources
+            .as_ref()
+            .map(|resources| resources.memory_mb.to_string())
+            .unwrap_or_else(|| "unlimited".into()),
+        manifest
+            .resources
+            .as_ref()
+            .map(|resources| resources.timeout_ms.to_string())
+            .unwrap_or_else(|| "unlimited".into()),
+        manifest
+            .resources
+            .as_ref()
+            .map(|resources| resources.max_concurrent_requests.to_string())
+            .unwrap_or_else(|| "1".into()),
         manifest
             .storage
             .as_ref()

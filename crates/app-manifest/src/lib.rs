@@ -16,6 +16,12 @@ pub struct Manifest {
     pub storage: Option<Storage>,
     #[serde(default, skip_serializing_if = "Secrets::is_empty")]
     pub secrets: Secrets,
+    #[serde(default, skip_serializing_if = "Config::is_empty")]
+    pub config: Config,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +64,32 @@ impl Secrets {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub allowed: Vec<String>,
+}
+
+impl Config {
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Network {
+    #[serde(default)]
+    pub outbound: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Resources {
+    pub memory_mb: u64,
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u32,
+}
+
 impl Manifest {
     pub fn from_spec(spec: &AppSpec, bytes: &[u8]) -> Self {
         let sha256 = hex(Sha256::digest(bytes).as_slice());
@@ -85,6 +117,17 @@ impl Manifest {
             secrets: Secrets {
                 required: spec.secrets.required.clone(),
             },
+            config: Config {
+                allowed: spec.config.allowed.clone(),
+            },
+            network: spec.network.as_ref().map(|network| Network {
+                outbound: network.outbound.clone(),
+            }),
+            resources: spec.resources.as_ref().map(|resources| Resources {
+                memory_mb: resources.memory_mb,
+                timeout_ms: resources.timeout_ms,
+                max_concurrent_requests: resources.max_concurrent_requests,
+            }),
         }
     }
 
@@ -143,6 +186,12 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         storage: Option<CanonicalStorage<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         secrets: Option<CanonicalSecrets<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config: Option<CanonicalConfig<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network: Option<CanonicalNetwork<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resources: Option<CanonicalResources>,
     }
 
     #[derive(Serialize)]
@@ -174,6 +223,23 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         required: &'a [String],
     }
 
+    #[derive(Serialize)]
+    struct CanonicalConfig<'a> {
+        allowed: &'a [String],
+    }
+
+    #[derive(Serialize)]
+    struct CanonicalNetwork<'a> {
+        outbound: &'a [String],
+    }
+
+    #[derive(Serialize)]
+    struct CanonicalResources {
+        memory_mb: u64,
+        timeout_ms: u64,
+        max_concurrent_requests: u32,
+    }
+
     let canonical = CanonicalManifest {
         name: &manifest.name,
         version: &manifest.version,
@@ -197,6 +263,20 @@ pub fn canonical_manifest(manifest: &Manifest) -> Result<Vec<u8>, String> {
         secrets: (!manifest.secrets.required.is_empty()).then_some(CanonicalSecrets {
             required: &manifest.secrets.required,
         }),
+        config: (!manifest.config.allowed.is_empty()).then_some(CanonicalConfig {
+            allowed: &manifest.config.allowed,
+        }),
+        network: manifest.network.as_ref().map(|network| CanonicalNetwork {
+            outbound: &network.outbound,
+        }),
+        resources: manifest
+            .resources
+            .as_ref()
+            .map(|resources| CanonicalResources {
+                memory_mb: resources.memory_mb,
+                timeout_ms: resources.timeout_ms,
+                max_concurrent_requests: resources.max_concurrent_requests,
+            }),
     };
 
     serde_json::to_vec(&canonical).map_err(|e| e.to_string())
@@ -208,6 +288,10 @@ fn hex(bytes: &[u8]) -> String {
 
 fn default_storage_path() -> String {
     ".app/data".into()
+}
+
+fn default_max_concurrent_requests() -> u32 {
+    1
 }
 
 #[cfg(test)]
@@ -234,6 +318,9 @@ mod tests {
                 path: ".app/data".into(),
             }),
             secrets: Secrets::default(),
+            config: Config::default(),
+            network: None,
+            resources: None,
         }
     }
 
@@ -333,6 +420,9 @@ mod tests {
             secrets: app_spec::Secrets {
                 required: vec!["OPENAI_API_KEY".into()],
             },
+            config: app_spec::Config::default(),
+            network: None,
+            resources: None,
         };
         let manifest = Manifest::from_spec(&spec, b"wasm");
         let json = serde_json::to_string(&manifest).unwrap();
@@ -351,5 +441,48 @@ mod tests {
             original.application_id(b"wasm").unwrap(),
             changed.application_id(b"wasm").unwrap()
         );
+    }
+
+    #[test]
+    fn manifest_includes_config_names_network_policy_and_resource_limits() {
+        let spec = AppSpec {
+            name: "hello".into(),
+            version: "0.1.0".into(),
+            build: app_spec::Build {
+                source: "src".into(),
+                language: "rust".into(),
+                toolchain: None,
+                entry: "src/main.rs".into(),
+                target: "wasm".into(),
+            },
+            runtime: app_spec::Runtime {
+                kind: "wasm".into(),
+            },
+            http: None,
+            capabilities: app_spec::Capabilities {
+                network: true,
+                filesystem: false,
+            },
+            storage: None,
+            secrets: app_spec::Secrets::default(),
+            config: app_spec::Config {
+                allowed: vec!["LOG_LEVEL".into()],
+            },
+            network: Some(app_spec::Network {
+                outbound: vec!["api.example.com".into()],
+            }),
+            resources: Some(app_spec::Resources {
+                memory_mb: 256,
+                timeout_ms: 30000,
+                max_concurrent_requests: 1,
+            }),
+        };
+
+        let manifest = Manifest::from_spec(&spec, b"wasm");
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        assert!(json.contains("LOG_LEVEL"), "{json}");
+        assert!(json.contains("api.example.com"), "{json}");
+        assert!(json.contains("memory_mb"), "{json}");
     }
 }

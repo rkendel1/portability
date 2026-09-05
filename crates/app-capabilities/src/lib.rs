@@ -45,15 +45,35 @@ impl From<CapabilityError> for String {
 #[derive(Clone)]
 pub struct NetworkCapability {
     allowed: bool,
+    destinations: BTreeSet<String>,
 }
 
 impl NetworkCapability {
     pub fn new(allowed: bool) -> Self {
-        Self { allowed }
+        Self::with_destinations(allowed, &[])
+    }
+
+    pub fn with_destinations(allowed: bool, destinations: &[String]) -> Self {
+        Self {
+            allowed,
+            destinations: destinations.iter().cloned().collect(),
+        }
     }
 
     pub fn connect(&self) -> Result<(), CapabilityError> {
-        if self.allowed {
+        if self.allowed && self.destinations.is_empty() {
+            Ok(())
+        } else {
+            Err(CapabilityError::CapabilityDenied {
+                capability: "network",
+                operation: "connect",
+            })
+        }
+    }
+
+    pub fn connect_to(&self, destination: &str) -> Result<(), CapabilityError> {
+        if self.allowed && (self.destinations.is_empty() || self.destinations.contains(destination))
+        {
             Ok(())
         } else {
             Err(CapabilityError::CapabilityDenied {
@@ -67,6 +87,46 @@ impl NetworkCapability {
 impl Capability for NetworkCapability {
     fn capability(&self) -> &'static str {
         "network"
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfigCapability {
+    declared: BTreeSet<String>,
+    values: BTreeMap<String, String>,
+}
+
+impl ConfigCapability {
+    pub fn new(
+        allowed: &[String],
+        values: BTreeMap<String, String>,
+    ) -> Result<Self, CapabilityError> {
+        let declared = allowed.iter().cloned().collect::<BTreeSet<_>>();
+        for name in values.keys() {
+            if !declared.contains(name) {
+                return Err(CapabilityError::CapabilityDenied {
+                    capability: "config",
+                    operation: "read",
+                });
+            }
+        }
+        Ok(Self { declared, values })
+    }
+
+    pub fn get(&self, name: &str) -> Result<Option<&str>, CapabilityError> {
+        if !self.declared.contains(name) {
+            return Err(CapabilityError::CapabilityDenied {
+                capability: "config",
+                operation: "read",
+            });
+        }
+        Ok(self.values.get(name).map(String::as_str))
+    }
+}
+
+impl Capability for ConfigCapability {
+    fn capability(&self) -> &'static str {
+        "config"
     }
 }
 
@@ -443,6 +503,16 @@ pub fn require_network(allowed: bool, _operation: &str) -> Result<(), String> {
         .map_err(Into::into)
 }
 
+pub fn require_network_destination(
+    allowed: bool,
+    destinations: &[String],
+    destination: &str,
+) -> Result<(), String> {
+    NetworkCapability::with_destinations(allowed, destinations)
+        .connect_to(destination)
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +561,35 @@ mod tests {
         assert_eq!(
             require_network(false, "connect").unwrap_err(),
             "CapabilityDenied { capability: \"network\", operation: \"connect\" }"
+        );
+    }
+
+    #[test]
+    fn declared_network_destinations_are_enforced() {
+        let allowed = vec!["api.example.com".to_string()];
+
+        require_network_destination(true, &allowed, "api.example.com").unwrap();
+        assert_eq!(
+            require_network_destination(true, &allowed, "other.example.com").unwrap_err(),
+            "CapabilityDenied { capability: \"network\", operation: \"connect\" }"
+        );
+        assert_eq!(require_network(true, "connect").unwrap(), ());
+        assert_eq!(
+            NetworkCapability::with_destinations(true, &allowed)
+                .connect()
+                .unwrap_err()
+                .to_string(),
+            "CapabilityDenied { capability: \"network\", operation: \"connect\" }"
+        );
+    }
+
+    #[test]
+    fn config_denies_undeclared_names() {
+        let config = ConfigCapability::new(&["LOG_LEVEL".into()], BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            config.get("API_BASE_URL").unwrap_err().to_string(),
+            "CapabilityDenied { capability: \"config\", operation: \"read\" }"
         );
     }
 

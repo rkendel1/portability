@@ -11,6 +11,8 @@ cargo run -p app -- run
 cargo run -p app -- run target/app.manifest.json
 cargo run -p app -- run target/app.manifest.json --state /var/lib/app/hello --state-provider filesystem
 cargo run -p app -- run target/app.manifest.json --secret OPENAI_API_KEY
+LOG_LEVEL=info cargo run -p app -- start target/app.manifest.json
+cargo run -p app -- logs target/app.manifest.json
 ```
 
 `app.toml` declares the application, build, runtime, HTTP endpoint, capabilities,
@@ -26,9 +28,10 @@ declared state capability to a local directory.
 The Application ID is `sha256:<hash>` over the deployable application: the
 canonical manifest immediately followed by the WASM bytes. The canonical
 manifest is compact JSON with fields emitted in this order: `name`, `version`,
-`runtime`, `artifact`, `http`, `capabilities`, `storage`, `secrets` when present;
-nested objects also use the field order shown by `target/app.manifest.json`. The manifest's own
-`artifact.sha256` still identifies only the WASM bytes for integrity checks.
+`runtime`, `artifact`, `http`, `capabilities`, `storage`, `secrets`, `config`,
+`network`, and `resources` when present; nested objects also use the field
+order shown by `target/app.manifest.json`. The manifest's own `artifact.sha256`
+still identifies only the WASM bytes for integrity checks.
 
 The v0.1 guest ABI is intentionally small: a guest may export `handle_request`.
 The runtime owns the socket and invokes the guest for every request. State is
@@ -40,6 +43,16 @@ Runtime secrets may be declared by name only with `[secrets] required = ["OPENAI
 Pass `--secret OPENAI_API_KEY` to resolve the value from the local environment
 at runtime; secret values are not written to manifests, WASM artifacts,
 Application IDs, or lifecycle records.
+Non-secret runtime configuration is declared separately with
+`[config] allowed = ["LOG_LEVEL"]` and exposed only through the config host
+capability; values come from the process environment at runtime and are not
+Application ID inputs. `[resources] memory_mb = 256` and
+`timeout_ms = 30000` bound Wasmtime execution, and
+`max_concurrent_requests` defaults to 1. `network = true` allows the runtime's
+network policy; adding `[network] outbound = ["api.example.com"]` restricts
+the host network capability to those destinations. `app start` writes runtime
+logs under `~/.appboundry/runtime/<Application ID>/runtime.log`, and
+`app logs target/app.manifest.json` prints them.
 
 `examples/hello` builds through Rust, and `examples/hello-go` builds through Go.
 Both emit the same `target/app.wasm` and `target/app.manifest.json` artifact
