@@ -321,16 +321,34 @@ func main() {}
     .unwrap();
 
     app(&project).arg("build").assert_success();
+    let built_id = application_id(&inspect(&project)).to_string();
+    let home = temp_project("go-network-denied-home");
     let port = listen_port(&project);
-    let mut child = run_app(&project);
+    let mut child = app(&project)
+        .arg("run")
+        .env("HOME", &home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     wait_for_listen(port, &mut child);
-    let _ = http_get(port, "/");
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let response = http_get(port, "/");
+    let second_response = http_get(port, "/");
+    stop_app(port, child);
+    let logs = fs::read_to_string(runtime_log_path(&home, &built_id)).unwrap();
 
     assert!(
-        stderr.contains("CapabilityDenied { capability: \"network\", operation: \"connect\" }"),
-        "{stderr}"
+        response.contains("HTTP/1.1 500 Internal Server Error")
+            && response.contains("WASM execution failed"),
+        "{response}"
+    );
+    assert!(
+        second_response.contains("HTTP/1.1 500 Internal Server Error"),
+        "{second_response}"
+    );
+    assert!(
+        logs.contains("CapabilityDenied { capability: \"network\", operation: \"connect\" }"),
+        "{logs}"
     );
 }
 
@@ -603,15 +621,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn run_app(project: &Path) -> Child {
-    app(project)
-        .arg("run")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
-}
-
 fn run_app_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> Child {
     app(cwd)
         .arg("run")
@@ -641,6 +650,16 @@ fn runtime_record_path(home: &Path, application_id: &str) -> std::path::PathBuf 
         }
     }
     path.join("runtime.json")
+}
+
+fn runtime_log_path(home: &Path, application_id: &str) -> std::path::PathBuf {
+    let mut path = home.join(".appboundry").join("runtime");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path.join("runtime.log")
 }
 
 fn run_app_manifest_with_state(cwd: &Path, manifest: &Path, state: &Path) -> Child {
