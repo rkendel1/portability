@@ -1,0 +1,8 @@
+[package]
+name = "app-compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+app-manifest = { path = "../app-manifest" }
+app-spec = { path = "../app-spec" }

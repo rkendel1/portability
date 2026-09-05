@@ -1,0 +1,9 @@
+[package]
+name = "app-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+app-capabilities = { path = "../app-capabilities" }
+app-manifest = { path = "../app-manifest" }
+wasmtime.workspace = true
