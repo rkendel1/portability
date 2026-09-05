@@ -1,0 +1,10 @@
+[package]
+name = "app-manifest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+app-spec = { path = "../app-spec" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

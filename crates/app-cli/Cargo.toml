@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+app-compiler = { path = "../app-compiler" }
+app-manifest = { path = "../app-manifest" }
+app-runtime = { path = "../app-runtime" }
+clap.workspace = true
