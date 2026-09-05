@@ -114,6 +114,8 @@ version = "0.1.0"
 dependencies = [
  "app-capabilities",
  "app-manifest",
+ "serde",
+ "serde_json",
  "wasmtime",
 ]
 

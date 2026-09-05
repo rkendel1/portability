@@ -1,11 +1,15 @@
 use app_capabilities::{
     CapabilityError, FeltDBStateProvider, NetworkCapability, StorageCapability,
 };
-use app_manifest::{Manifest, sha256};
+use app_manifest::{ApplicationId, Manifest, sha256};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Engine, Linker, Module, Store};
 
 #[derive(Clone)]
@@ -18,10 +22,47 @@ pub fn run(project: &Path) -> Result<(), String> {
     run_with_state(project, None)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateProviderKind {
     Filesystem,
     FeltDB,
+}
+
+impl StateProviderKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            StateProviderKind::Filesystem => "filesystem",
+            StateProviderKind::FeltDB => "FeltDB",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedApplication {
+    pub application_id: ApplicationId,
+    pub name: String,
+    pub endpoint: String,
+    pub state_provider: StateProviderKind,
+    pub state_location: Option<PathBuf>,
+    pub artifact_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRecord {
+    pub application_id: String,
+    pub name: String,
+    pub pid: u32,
+    pub endpoint: String,
+    pub state_provider: StateProviderKind,
+    pub state_location: Option<PathBuf>,
+    pub artifact_path: PathBuf,
+    pub started_at: u64,
+}
+
+#[derive(Debug)]
+pub enum ApplicationStatus {
+    Running(RuntimeRecord),
+    Stopped(PreparedApplication),
 }
 
 pub fn run_with_state(project: &Path, state: Option<&Path>) -> Result<(), String> {
@@ -59,15 +100,10 @@ fn run_from_manifest(
     state: Option<&Path>,
     provider: StateProviderKind,
 ) -> Result<(), String> {
-    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
-    let application_id = manifest.application_id(&wasm)?;
-    let host_state = host_state(
-        default_state_base,
-        state,
-        provider,
-        &application_id.to_string(),
-        &manifest,
-    )?;
+    let runtime = runtime_application(manifest_path, default_state_base, state, provider)?;
+    let manifest = runtime.manifest;
+    let wasm = runtime.wasm;
+    let host_state = runtime.host_state;
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
     let http = manifest.http.ok_or("no HTTP endpoint declared")?;
@@ -86,18 +122,167 @@ fn run_from_manifest(
     Ok(())
 }
 
+pub fn prepare_start(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<PreparedApplication, String> {
+    let runtime = runtime_application(manifest_path, default_state_base, state, provider)?;
+    reject_if_running(&runtime.prepared.application_id)?;
+    Ok(runtime.prepared)
+}
+
+pub fn record_started(prepared: PreparedApplication, pid: u32) -> Result<RuntimeRecord, String> {
+    let record = RuntimeRecord {
+        application_id: prepared.application_id.to_string(),
+        name: prepared.name,
+        pid,
+        endpoint: prepared.endpoint,
+        state_provider: prepared.state_provider,
+        state_location: prepared.state_location,
+        artifact_path: prepared.artifact_path,
+        started_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs(),
+    };
+    let path = record_path(&record.application_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
+pub fn status(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<ApplicationStatus, String> {
+    let prepared = prepare_status(manifest_path, default_state_base, state, provider)?;
+    match read_record(prepared.application_id.as_str())? {
+        Some(record) if process_running(record.pid) => Ok(ApplicationStatus::Running(record)),
+        Some(_) => {
+            remove_record(prepared.application_id.as_str())?;
+            Ok(ApplicationStatus::Stopped(prepared))
+        }
+        None => Ok(ApplicationStatus::Stopped(prepared)),
+    }
+}
+
+pub fn stop(manifest_path: &Path) -> Result<RuntimeRecord, String> {
+    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let Some(record) = read_record(application_id.as_str())? else {
+        return Err(format!("application {application_id} is not running"));
+    };
+    if !process_running(record.pid) {
+        remove_record(application_id.as_str())?;
+        return Err(format!("application {application_id} is not running"));
+    }
+    terminate(record.pid)?;
+    remove_record(application_id.as_str())?;
+    Ok(record)
+}
+
+struct RuntimeApplication {
+    manifest: Manifest,
+    wasm: Vec<u8>,
+    host_state: HostState,
+    prepared: PreparedApplication,
+}
+
+fn runtime_application(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<RuntimeApplication, String> {
+    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let state_location = manifest
+        .storage
+        .as_ref()
+        .map(|storage| {
+            state_root(
+                default_state_base,
+                state,
+                provider,
+                &storage.path,
+                application_id.as_str(),
+            )
+        })
+        .transpose()?;
+    let host_state = host_state(
+        default_state_base,
+        state,
+        provider,
+        application_id.as_str(),
+        &manifest,
+    )?;
+    let listen = manifest
+        .http
+        .as_ref()
+        .ok_or("no HTTP endpoint declared")?
+        .listen;
+    let name = manifest.name.clone();
+    Ok(RuntimeApplication {
+        manifest,
+        wasm,
+        host_state,
+        prepared: PreparedApplication {
+            application_id,
+            name,
+            endpoint: format!("http://127.0.0.1:{listen}"),
+            state_provider: provider,
+            state_location,
+            artifact_path: artifact_path(manifest_path)?,
+        },
+    })
+}
+
+fn prepare_status(
+    manifest_path: &Path,
+    default_state_base: &Path,
+    state: Option<&Path>,
+    provider: StateProviderKind,
+) -> Result<PreparedApplication, String> {
+    Ok(runtime_application(manifest_path, default_state_base, state, provider)?.prepared)
+}
+
 fn load_manifest_artifact(manifest_path: &Path) -> Result<(Manifest, Vec<u8>), String> {
     let manifest = Manifest::load(manifest_path)?;
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
-    let artifact_path = manifest_dir.join(&manifest.artifact.file);
+    let artifact_path = artifact_path_for(manifest_path, &manifest)?;
     let wasm = fs::read(&artifact_path)
         .map_err(|e| format!("cannot read artifact {}: {e}", artifact_path.display()))?;
     if sha256(&wasm) != manifest.artifact.sha256 {
         return Err("artifact hash mismatch".into());
     }
     Ok((manifest, wasm))
+}
+
+fn artifact_path(manifest_path: &Path) -> Result<PathBuf, String> {
+    let manifest = Manifest::load(manifest_path)?;
+    artifact_path_for(manifest_path, &manifest)
+}
+
+fn artifact_path_for(manifest_path: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    let artifact_path = manifest_dir.join(&manifest.artifact.file);
+    Ok(artifact_path
+        .canonicalize()
+        .unwrap_or_else(|_| artifact_path.to_path_buf()))
 }
 
 fn host_state(
@@ -169,6 +354,100 @@ fn feltdb_state_root(home: &Path, application_id: &str) -> PathBuf {
         }
     }
     root
+}
+
+fn reject_if_running(application_id: &ApplicationId) -> Result<(), String> {
+    if let Some(record) = read_record(application_id.as_str())? {
+        if process_running(record.pid) {
+            return Err(format!(
+                "application {application_id} already running (pid {})",
+                record.pid
+            ));
+        }
+        remove_record(application_id.as_str())?;
+    }
+    Ok(())
+}
+
+fn read_record(application_id: &str) -> Result<Option<RuntimeRecord>, String> {
+    let path = record_path(application_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record = serde_json::from_reader(fs::File::open(&path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(record))
+}
+
+fn remove_record(application_id: &str) -> Result<(), String> {
+    let path = record_path(application_id)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn record_path(application_id: &str) -> Result<PathBuf, String> {
+    let mut path = runtime_root()?;
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path.push("runtime.json");
+    Ok(path)
+}
+
+fn runtime_root() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "cannot determine home directory for AppBoundry runtime state".to_string()
+        })?;
+    Ok(home.join(".appboundry").join("runtime"))
+}
+
+fn process_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn terminate(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("failed to terminate pid {pid}"))
+            }
+        })?;
+    let deadline = SystemTime::now() + Duration::from_secs(5);
+    while SystemTime::now() < deadline {
+        if !process_running(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(), String> {

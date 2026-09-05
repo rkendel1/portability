@@ -58,7 +58,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         let feltdb_state_a = temp_project(&format!("{example}-feltdb-state-a"));
         let feltdb_state_b = temp_project(&format!("{example}-feltdb-state-b"));
         let default_home = temp_project(&format!("{example}-default-home"));
-        let default_feltdb_state = default_feltdb_state(&default_home, built_id);
+        let default_state_root = default_feltdb_state(&default_home, built_id);
 
         let mut portable = run_app_manifest_with_state(
             &std::env::temp_dir(),
@@ -66,7 +66,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             &state_a,
         );
         wait_for_listen(port, &mut portable);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, portable);
         assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
         assert!(!artifact.join(".app/data/counter").exists());
@@ -80,7 +80,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             &state_b,
         );
         wait_for_listen(port, &mut portable);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, portable);
         assert_eq!(fs::read_to_string(state_b.join("counter")).unwrap(), "1");
         assert_eq!(fs::read_to_string(state_a.join("counter")).unwrap(), "1");
@@ -93,7 +93,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             "feltdb",
         );
         wait_for_listen(port, &mut feltdb);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, feltdb);
         assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
@@ -108,7 +108,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             "feltdb",
         );
         wait_for_listen(port, &mut feltdb);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, feltdb);
         assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
@@ -120,7 +120,7 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             "feltdb",
         );
         wait_for_listen(port, &mut isolated_feltdb);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, isolated_feltdb);
         assert_eq!(felt_state(&feltdb_state_b, built_id, "counter"), "MQ==");
         assert_eq!(felt_state(&feltdb_state_a, built_id, "counter"), "MQ==");
@@ -132,12 +132,9 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             &default_home,
         );
         wait_for_listen(port, &mut first);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, first);
-        assert_eq!(
-            felt_state(&default_feltdb_state, built_id, "counter"),
-            "MQ=="
-        );
+        assert_eq!(felt_state(&default_state_root, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
 
         let mut second = run_app_manifest_with_home(
@@ -146,13 +143,115 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             &default_home,
         );
         wait_for_listen(port, &mut second);
-        assert!(http_get(port, "/").contains("Hello from WASM"));
+        wait_for_http(port);
         stop_app(port, second);
-        assert_eq!(
-            felt_state(&default_feltdb_state, built_id, "counter"),
-            "MQ=="
-        );
+        assert_eq!(felt_state(&default_state_root, built_id, "counter"), "MQ==");
         assert!(!artifact.join(".app/data/counter").exists());
+
+        let lifecycle_home = temp_project(&format!("{example}-lifecycle-home"));
+        let lifecycle_state = default_feltdb_state(&lifecycle_home, built_id);
+        let started = start_app_manifest_with_home(
+            &std::env::temp_dir(),
+            &artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(started.contains("Started hello"), "{started}");
+        assert!(started.contains(built_id), "{started}");
+        wait_for_http(port);
+
+        let moved_artifact = temp_project(&format!("{example}-moved-artifact"));
+        fs::copy(artifact.join("app.wasm"), moved_artifact.join("app.wasm")).unwrap();
+        fs::copy(
+            artifact.join("app.manifest.json"),
+            moved_artifact.join("app.manifest.json"),
+        )
+        .unwrap();
+        let moved_inspect = inspect_manifest(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+        );
+        assert_eq!(application_id(&moved_inspect), built_id);
+
+        let status = status_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(status.contains("Status:       running"), "{status}");
+        assert!(
+            status.contains(&format!("Endpoint:     http://127.0.0.1:{port}")),
+            "{status}"
+        );
+        assert!(status.contains("State:        FeltDB"), "{status}");
+        assert!(status.contains("Artifact:     verified"), "{status}");
+        wait_for_http(port);
+        assert_eq!(felt_state(&lifecycle_state, built_id, "counter"), "MQ==");
+
+        let duplicate = start_app_manifest_with_home_failure(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(duplicate.contains("already running"), "{duplicate}");
+
+        let stopped = stop_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(stopped.contains("Status:       stopped"), "{stopped}");
+        wait_for_port_release(port);
+
+        let restarted = start_app_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(restarted.contains(built_id), "{restarted}");
+        wait_for_http(port);
+        stop_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        wait_for_port_release(port);
+        assert_eq!(felt_state(&lifecycle_state, built_id, "counter"), "MQ==");
+
+        let lifecycle_fs_state = temp_project(&format!("{example}-lifecycle-fs-state"));
+        let lifecycle_fs_home = temp_project(&format!("{example}-lifecycle-fs-home"));
+        let fs_started = start_app_manifest_with_state_provider_and_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_fs_state,
+            &lifecycle_fs_home,
+            "filesystem",
+        );
+        assert!(fs_started.contains("Started hello"), "{fs_started}");
+        wait_for_http(port);
+        stop_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_fs_home,
+        );
+        wait_for_port_release(port);
+        assert_eq!(
+            fs::read_to_string(lifecycle_fs_state.join("counter")).unwrap(),
+            "1"
+        );
+
+        let tampered = temp_project(&format!("{example}-tampered-artifact"));
+        fs::copy(
+            moved_artifact.join("app.manifest.json"),
+            tampered.join("app.manifest.json"),
+        )
+        .unwrap();
+        fs::write(tampered.join("app.wasm"), b"tampered").unwrap();
+        let tampered_start =
+            start_app_manifest_failure(&std::env::temp_dir(), &tampered.join("app.manifest.json"));
+        assert!(
+            tampered_start.contains("artifact hash mismatch"),
+            "{tampered_start}"
+        );
     }
 
     assert!(
@@ -417,6 +516,45 @@ fn run_app_manifest_with_state_provider(
         .unwrap()
 }
 
+fn start_app_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(app(cwd).arg("start").arg(manifest).env("HOME", home))
+}
+
+fn start_app_manifest_with_home_failure(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    failed_output(app(cwd).arg("start").arg(manifest).env("HOME", home))
+}
+
+fn start_app_manifest_with_state_provider_and_home(
+    cwd: &Path,
+    manifest: &Path,
+    state: &Path,
+    home: &Path,
+    provider: &str,
+) -> String {
+    successful_output(
+        app(cwd)
+            .arg("start")
+            .arg(manifest)
+            .arg("--state")
+            .arg(state)
+            .arg("--state-provider")
+            .arg(provider)
+            .env("HOME", home),
+    )
+}
+
+fn start_app_manifest_failure(cwd: &Path, manifest: &Path) -> String {
+    failed_output(app(cwd).arg("start").arg(manifest))
+}
+
+fn status_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(app(cwd).arg("status").arg(manifest).env("HOME", home))
+}
+
+fn stop_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(app(cwd).arg("stop").arg(manifest).env("HOME", home))
+}
+
 fn felt_state(state: &Path, application_id: &str, key: &str) -> String {
     let bridge =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../app-capabilities/feltdb-state-provider.mjs");
@@ -437,6 +575,21 @@ fn felt_state(state: &Path, application_id: &str, key: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn failed_output(command: &mut Command) -> String {
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 fn stop_app(port: u16, mut child: Child) {
     child.kill().ok();
     child.wait().ok();
@@ -452,6 +605,26 @@ fn wait_for_port_release(port: u16) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("timed out waiting for port {port} to be released");
+}
+
+fn wait_for_http(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).ok();
+            if response.contains("Hello from WASM") {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for http://127.0.0.1:{port}");
 }
 
 fn wait_for_listen(port: u16, child: &mut Child) {
