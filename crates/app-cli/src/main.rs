@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::thread;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -159,15 +159,10 @@ fn start(
         .arg("--state-provider")
         .arg(state_provider.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = command.spawn().map_err(|e| e.to_string())?;
-    thread::sleep(Duration::from_millis(200));
-    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-        return Err(format!(
-            "application exited during start with status {status}"
-        ));
-    }
+    wait_for_started(&mut child, &prepared.endpoint)?;
     match app_runtime::record_started(prepared, child.id()) {
         Ok(record) => {
             println!(
@@ -179,6 +174,31 @@ fn start(
         Err(error) => {
             child.kill().ok();
             Err(error)
+        }
+    }
+}
+
+fn wait_for_started(child: &mut std::process::Child, endpoint: &str) -> Result<(), String> {
+    let stdout = child.stdout.take().ok_or("cannot read app start output")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        tx.send(result).ok();
+    });
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(line)) if line.contains(&format!("listening on {endpoint}")) => Ok(()),
+        Ok(Ok(line)) => {
+            child.kill().ok();
+            Err(format!("unexpected app start output: {line}"))
+        }
+        Ok(Err(error)) => {
+            child.kill().ok();
+            Err(format!("failed to read app start output: {error}"))
+        }
+        Err(_) => {
+            child.kill().ok();
+            Err(format!("timed out waiting for app to listen on {endpoint}"))
         }
     }
 }
