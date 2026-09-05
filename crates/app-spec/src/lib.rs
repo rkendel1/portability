@@ -17,6 +17,12 @@ pub struct AppSpec {
     pub storage: Option<Storage>,
     #[serde(default)]
     pub secrets: Secrets,
+    #[serde(default)]
+    pub config: Config,
+    #[serde(default)]
+    pub network: Option<Network>,
+    #[serde(default)]
+    pub resources: Option<Resources>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -61,6 +67,26 @@ pub struct Secrets {
     pub required: Vec<String>,
 }
 
+#[derive(Debug, Default, Deserialize, PartialEq)]
+pub struct Config {
+    #[serde(default)]
+    pub allowed: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+pub struct Network {
+    #[serde(default)]
+    pub outbound: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct Resources {
+    pub memory_mb: u64,
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u32,
+}
+
 impl AppSpec {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text =
@@ -101,7 +127,7 @@ impl AppSpec {
         }
         let mut secret_names = BTreeSet::new();
         for secret in &self.secrets.required {
-            if !valid_secret_name(secret) {
+            if !valid_runtime_name(secret) {
                 return Err(
                     "secret names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
                         .into(),
@@ -109,6 +135,43 @@ impl AppSpec {
             }
             if !secret_names.insert(secret) {
                 return Err(format!("duplicate required secret '{secret}'"));
+            }
+        }
+        let mut config_names = BTreeSet::new();
+        for config in &self.config.allowed {
+            if !valid_runtime_name(config) {
+                return Err(
+                    "config names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
+                        .into(),
+                );
+            }
+            if !config_names.insert(config) {
+                return Err(format!("duplicate allowed config '{config}'"));
+            }
+        }
+        if let Some(network) = &self.network {
+            if !self.capabilities.network && !network.outbound.is_empty() {
+                return Err("network destinations require network capability".into());
+            }
+            let mut destinations = BTreeSet::new();
+            for destination in &network.outbound {
+                if !valid_destination(destination) {
+                    return Err(format!("invalid network destination '{destination}'"));
+                }
+                if !destinations.insert(destination) {
+                    return Err(format!("duplicate network destination '{destination}'"));
+                }
+            }
+        }
+        if let Some(resources) = &self.resources {
+            if resources.memory_mb == 0 {
+                return Err("resources.memory_mb must be greater than zero".into());
+            }
+            if resources.timeout_ms == 0 {
+                return Err("resources.timeout_ms must be greater than zero".into());
+            }
+            if resources.max_concurrent_requests == 0 {
+                return Err("resources.max_concurrent_requests must be greater than zero".into());
             }
         }
 
@@ -124,10 +187,23 @@ fn default_build_target() -> String {
     "wasm".into()
 }
 
-fn valid_secret_name(name: &str) -> bool {
+fn default_max_concurrent_requests() -> u32 {
+    1
+}
+
+fn valid_runtime_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_uppercase() || c == '_')
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn valid_destination(destination: &str) -> bool {
+    !destination.is_empty()
+        && !destination.contains("://")
+        && !destination.contains('/')
+        && destination.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 #[cfg(test)]
@@ -263,6 +339,84 @@ required = ["openai_api_key"]
         assert_eq!(
             spec.validate().unwrap_err(),
             "secret names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
+        );
+    }
+
+    #[test]
+    fn parses_runtime_config_network_and_resource_limits() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[capabilities]
+network = true
+[config]
+allowed = ["LOG_LEVEL", "API_BASE_URL"]
+[network]
+outbound = ["api.example.com"]
+[resources]
+memory_mb = 256
+timeout_ms = 30000
+"#,
+        )
+        .unwrap();
+
+        spec.validate().unwrap();
+        assert_eq!(spec.config.allowed, ["LOG_LEVEL", "API_BASE_URL"]);
+        assert_eq!(spec.network.unwrap().outbound, ["api.example.com"]);
+        assert_eq!(spec.resources.unwrap().max_concurrent_requests, 1);
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_config_name() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[config]
+allowed = ["log_level"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "config names must contain only uppercase letters, digits or '_' and start with a letter or '_'"
+        );
+    }
+
+    #[test]
+    fn rejects_destinations_without_network_capability() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+name = "hello"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[capabilities]
+network = false
+[network]
+outbound = ["api.example.com"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "network destinations require network capability"
         );
     }
 }

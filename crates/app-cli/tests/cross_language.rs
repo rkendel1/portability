@@ -209,6 +209,15 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         );
         assert!(restarted.contains(built_id), "{restarted}");
         wait_for_http(port);
+        let logs = logs_manifest_with_home(
+            &std::env::temp_dir(),
+            &moved_artifact.join("app.manifest.json"),
+            &lifecycle_home,
+        );
+        assert!(
+            logs.contains(&format!("{example} listening on http://127.0.0.1:{port}")),
+            "{logs}"
+        );
         stop_manifest_with_home(
             &std::env::temp_dir(),
             &moved_artifact.join("app.manifest.json"),
@@ -694,6 +703,10 @@ fn status_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String
 
 fn stop_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
     successful_output(app(cwd).arg("stop").arg(manifest).env("HOME", home))
+}
+
+fn logs_manifest_with_home(cwd: &Path, manifest: &Path, home: &Path) -> String {
+    successful_output(app(cwd).arg("logs").arg(manifest).env("HOME", home))
 }
 
 fn felt_state(state: &Path, application_id: &str, key: &str) -> String {

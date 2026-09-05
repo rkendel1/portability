@@ -1,5 +1,6 @@
 use app_capabilities::{
-    CapabilityError, FeltDBStateProvider, NetworkCapability, SecretCapability, StorageCapability,
+    CapabilityError, ConfigCapability, FeltDBStateProvider, NetworkCapability, SecretCapability,
+    StorageCapability,
 };
 use app_manifest::{ApplicationId, Manifest, sha256};
 use serde::{Deserialize, Serialize};
@@ -9,15 +10,24 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Clone)]
 struct HostState {
     network: NetworkCapability,
     storage: Option<StorageCapability>,
     secrets: SecretCapability,
+    config: ConfigCapability,
+    limits: StoreLimits,
+    execution_fuel: Option<u64>,
+    requests: RequestLimiter,
+    log_path: Option<PathBuf>,
 }
 
 pub fn run(project: &Path) -> Result<(), String> {
@@ -31,6 +41,44 @@ pub enum StateProviderKind {
 }
 
 pub type RuntimeSecrets = BTreeMap<String, String>;
+pub type RuntimeConfig = BTreeMap<String, String>;
+
+#[derive(Clone)]
+struct RequestLimiter {
+    max: usize,
+    active: Arc<AtomicUsize>,
+}
+
+struct RequestPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl RequestLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn enter(&self) -> Result<RequestPermit, String> {
+        let previous = self.active.fetch_add(1, Ordering::SeqCst);
+        if previous >= self.max {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Err("request concurrency limit exceeded".into())
+        } else {
+            Ok(RequestPermit {
+                active: Arc::clone(&self.active),
+            })
+        }
+    }
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl StateProviderKind {
     pub fn label(self) -> &'static str {
@@ -133,19 +181,24 @@ fn run_from_manifest(
     let manifest = runtime.manifest;
     let wasm = runtime.wasm;
     let host_state = runtime.host_state;
-    let engine = Engine::default();
+    let engine = engine(host_state.execution_fuel.is_some())?;
     let module = Module::new(&engine, wasm).map_err(|e| e.to_string())?;
     let http = manifest.http.ok_or("no HTTP endpoint declared")?;
     let listener = TcpListener::bind(("127.0.0.1", http.listen)).map_err(|e| e.to_string())?;
-    println!(
+    let listen = format!(
         "{} listening on http://127.0.0.1:{}",
         manifest.name, http.listen
     );
+    log_line(&host_state.log_path, &listen)?;
+    println!("{listen}");
     for stream in listener.incoming() {
         let mut stream = stream.map_err(|e| e.to_string())?;
         let mut request = [0; 1024];
         stream.read(&mut request).map_err(|e| e.to_string())?;
-        invoke(&engine, &module, host_state.clone())?;
+        if let Err(error) = invoke(&engine, &module, host_state.clone()) {
+            log_line(&host_state.log_path, &format!("ERROR {error}"))?;
+            return Err(error);
+        }
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nHello from WASM").map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -205,6 +258,23 @@ pub fn record_started(prepared: PreparedApplication, pid: u32) -> Result<Runtime
     )
     .map_err(|e| e.to_string())?;
     Ok(record)
+}
+
+pub fn logs(manifest_path: &Path) -> Result<String, String> {
+    let (manifest, wasm) = load_manifest_artifact(manifest_path)?;
+    let application_id = manifest.application_id(&wasm)?;
+    let path = log_path(application_id.as_str())?;
+    match fs::read_to_string(&path) {
+        Ok(logs) => Ok(logs),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("no logs for application {application_id}"))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn log_path_for_application_id(application_id: &ApplicationId) -> Result<PathBuf, String> {
+    log_path(application_id.as_str())
 }
 
 pub fn status(
@@ -391,12 +461,69 @@ fn host_state(
         (None, true) => return Err("filesystem capability requires storage declaration".into()),
         (Some(_), false) => return Err("storage declaration requires filesystem capability".into()),
     };
+    let config = runtime_config(&manifest.config.allowed);
+    let (store_limits, execution_fuel, request_limit) =
+        runtime_limits(manifest.resources.as_ref())?;
+    let destinations = manifest
+        .network
+        .as_ref()
+        .map(|network| network.outbound.as_slice())
+        .unwrap_or(&[]);
     Ok(HostState {
-        network: NetworkCapability::new(manifest.capabilities.network),
+        network: NetworkCapability::with_destinations(manifest.capabilities.network, destinations),
         storage,
         secrets: SecretCapability::new(&manifest.secrets.required, secrets.clone())
             .map_err(|error| error.to_string())?,
+        config: ConfigCapability::new(&manifest.config.allowed, config)
+            .map_err(|error| error.to_string())?,
+        limits: store_limits,
+        execution_fuel,
+        requests: RequestLimiter::new(request_limit),
+        log_path: std::env::var_os("APP_RUNTIME_LOG")
+            .map(PathBuf::from)
+            .or_else(|| log_path(application_id).ok()),
     })
+}
+
+fn runtime_config(allowed: &[String]) -> RuntimeConfig {
+    allowed
+        .iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .collect()
+}
+
+fn runtime_limits(
+    resources: Option<&app_manifest::Resources>,
+) -> Result<(StoreLimits, Option<u64>, usize), String> {
+    let mut limits = StoreLimitsBuilder::new().instances(1);
+    let mut fuel = None;
+    let mut request_limit = 1;
+    if let Some(resources) = resources {
+        if resources.memory_mb == 0 {
+            return Err("resources.memory_mb must be greater than zero".into());
+        }
+        if resources.timeout_ms == 0 {
+            return Err("resources.timeout_ms must be greater than zero".into());
+        }
+        if resources.max_concurrent_requests == 0 {
+            return Err("resources.max_concurrent_requests must be greater than zero".into());
+        }
+        let memory_bytes = resources
+            .memory_mb
+            .checked_mul(1024)
+            .and_then(|mb| mb.checked_mul(1024))
+            .ok_or_else(|| "resources.memory_mb is too large".to_string())?
+            as usize;
+        limits = limits.memory_size(memory_bytes).trap_on_grow_failure(true);
+        fuel = Some(
+            resources
+                .timeout_ms
+                .checked_mul(1000)
+                .ok_or_else(|| "resources.timeout_ms is too large".to_string())?,
+        );
+        request_limit = resources.max_concurrent_requests as usize;
+    }
+    Ok((limits.build(), fuel, request_limit))
 }
 
 fn state_root(
@@ -486,6 +613,32 @@ fn runtime_root() -> Result<PathBuf, String> {
     Ok(home.join(".appboundry").join("runtime"))
 }
 
+fn log_path(application_id: &str) -> Result<PathBuf, String> {
+    let mut path = runtime_root()?;
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path.push("runtime.log");
+    Ok(path)
+}
+
+fn log_line(path: &Option<PathBuf>, line: &str) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{line}").map_err(|e| e.to_string())
+}
+
 fn process_running(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
@@ -528,9 +681,14 @@ fn terminate(pid: u32) -> Result<(), String> {
 }
 
 fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(), String> {
+    let _permit = host_state.requests.enter()?;
     let mut linker = Linker::new(engine);
     add_host_functions(&mut linker)?;
     let mut store = Store::new(engine, host_state);
+    store.limiter(|state| &mut state.limits);
+    if let Some(fuel) = store.data().execution_fuel {
+        store.set_fuel(fuel).map_err(|e| e.to_string())?;
+    }
     let instance = linker
         .instantiate(&mut store, module)
         .map_err(runtime_error)?;
@@ -548,7 +706,21 @@ fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(),
 }
 
 fn runtime_error(error: wasmtime::Error) -> String {
-    format!("{error:?}")
+    let error = format!("{error:?}");
+    if error.contains("all fuel consumed") {
+        "wasm execution timed out".into()
+    } else {
+        error
+    }
+}
+
+fn engine(consume_fuel: bool) -> Result<Engine, String> {
+    if !consume_fuel {
+        return Ok(Engine::default());
+    }
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    Engine::new(&config).map_err(|e| e.to_string())
 }
 
 fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
@@ -562,6 +734,23 @@ fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
                     .data()
                     .network
                     .connect()
+                    .map_err(|error| wasmtime::format_err!("{error}"))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "network_connect_to",
+            |mut caller: Caller<'_, HostState>,
+             destination_ptr: i32,
+             destination_len: i32|
+             -> wasmtime::Result<()> {
+                let destination = guest_string(&mut caller, destination_ptr, destination_len)?;
+                caller
+                    .data()
+                    .network
+                    .connect_to(&destination)
                     .map_err(|error| wasmtime::format_err!("{error}"))
             },
         )
@@ -589,6 +778,38 @@ fn add_host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
                     .to_vec();
                 if value.len() > value_len as usize {
                     return Err(wasmtime::format_err!("secret output buffer too small"));
+                }
+                write_guest_bytes(&mut caller, value_ptr, &value)?;
+                Ok(value.len() as i32)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "app_capabilities",
+            "get_config",
+            |mut caller: Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             value_ptr: i32,
+             value_len: i32|
+             -> wasmtime::Result<i32> {
+                if value_len < 0 {
+                    return Err(wasmtime::format_err!("guest length must be non-negative"));
+                }
+                let name = guest_string(&mut caller, name_ptr, name_len)?;
+                let Some(value) = caller
+                    .data()
+                    .config
+                    .get(&name)
+                    .map_err(|error| wasmtime::format_err!("{error}"))?
+                    .map(str::as_bytes)
+                else {
+                    return Ok(-1);
+                };
+                let value = value.to_vec();
+                if value.len() > value_len as usize {
+                    return Err(wasmtime::format_err!("config output buffer too small"));
                 }
                 write_guest_bytes(&mut caller, value_ptr, &value)?;
                 Ok(value.len() as i32)
@@ -735,7 +956,10 @@ fn add_wasi_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
                     output.extend(guest_bytes(&mut caller, ptr, len as i32)?);
                 }
                 let written = output.len() as u32;
-                eprint!("{}", String::from_utf8_lossy(&output));
+                let output = String::from_utf8_lossy(&output);
+                eprint!("{output}");
+                log_line(&caller.data().log_path, &output)
+                    .map_err(|error| wasmtime::format_err!("{error}"))?;
                 write_u32(&mut caller, nwritten, written)?;
                 Ok(0)
             },
@@ -856,6 +1080,11 @@ mod tests {
             network: NetworkCapability::new(network),
             storage,
             secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
+            config: ConfigCapability::new(&[], RuntimeConfig::new()).unwrap(),
+            limits: StoreLimitsBuilder::new().instances(1).build(),
+            execution_fuel: None,
+            requests: RequestLimiter::new(1),
+            log_path: None,
         }
     }
 
@@ -876,6 +1105,55 @@ mod tests {
             network: NetworkCapability::new(false),
             storage,
             secrets: SecretCapability::new(&required, values).unwrap(),
+            config: ConfigCapability::new(&[], RuntimeConfig::new()).unwrap(),
+            limits: StoreLimitsBuilder::new().instances(1).build(),
+            execution_fuel: None,
+            requests: RequestLimiter::new(1),
+            log_path: None,
+        }
+    }
+
+    fn host_state_with_config(allowed: &[&str], values: &[(&str, &str)]) -> HostState {
+        let allowed = allowed
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let values = values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        HostState {
+            network: NetworkCapability::new(false),
+            storage: None,
+            secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
+            config: ConfigCapability::new(&allowed, values).unwrap(),
+            limits: StoreLimitsBuilder::new().instances(1).build(),
+            execution_fuel: None,
+            requests: RequestLimiter::new(1),
+            log_path: None,
+        }
+    }
+
+    fn host_state_with_limits(
+        memory_mb: u64,
+        timeout_ms: u64,
+        max_concurrent_requests: u32,
+    ) -> HostState {
+        let resources = app_manifest::Resources {
+            memory_mb,
+            timeout_ms,
+            max_concurrent_requests,
+        };
+        let (limits, fuel, request_limit) = runtime_limits(Some(&resources)).unwrap();
+        HostState {
+            network: NetworkCapability::new(false),
+            storage: None,
+            secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
+            config: ConfigCapability::new(&[], RuntimeConfig::new()).unwrap(),
+            limits,
+            execution_fuel: fuel,
+            requests: RequestLimiter::new(request_limit),
+            log_path: None,
         }
     }
 
@@ -899,6 +1177,9 @@ mod tests {
                 path: ".app/data".into(),
             }),
             secrets: app_manifest::Secrets::default(),
+            config: app_manifest::Config::default(),
+            network: None,
+            resources: None,
         }
     }
 
@@ -1093,6 +1374,33 @@ mod tests {
     }
 
     #[test]
+    fn declared_network_destination_is_allowed_at_host_boundary() {
+        let engine = Engine::default();
+        let module = network_destination_module(&engine, "api.example.com");
+        let mut host_state = host_state(false, None);
+        host_state.network =
+            NetworkCapability::with_destinations(true, &["api.example.com".into()]);
+
+        invoke(&engine, &module, host_state).unwrap();
+    }
+
+    #[test]
+    fn undeclared_network_destination_is_denied_at_host_boundary() {
+        let engine = Engine::default();
+        let module = network_destination_module(&engine, "other.example.com");
+        let mut host_state = host_state(false, None);
+        host_state.network =
+            NetworkCapability::with_destinations(true, &["api.example.com".into()]);
+
+        let error = invoke(&engine, &module, host_state).unwrap_err();
+
+        assert!(
+            error.contains("CapabilityDenied { capability: \"network\", operation: \"connect\" }"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn filesystem_false_denies_storage_operation_at_host_boundary() {
         let engine = Engine::default();
         let module = storage_write_module(&engine, "/data/counter", "value");
@@ -1221,6 +1529,149 @@ mod tests {
         assert_eq!(error, "required secret 'OPENAI_API_KEY' was not provided");
     }
 
+    #[test]
+    fn declared_config_is_available_at_host_boundary() {
+        let engine = Engine::default();
+        let module = config_equals_module(&engine, "LOG_LEVEL", "info");
+
+        invoke(
+            &engine,
+            &module,
+            host_state_with_config(&["LOG_LEVEL"], &[("LOG_LEVEL", "info")]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn undeclared_config_is_denied_at_host_boundary() {
+        let engine = Engine::default();
+        let module = config_equals_module(&engine, "API_BASE_URL", "https://api.example.com");
+
+        let error = invoke(
+            &engine,
+            &module,
+            host_state_with_config(&["LOG_LEVEL"], &[]),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("CapabilityDenied { capability: \"config\", operation: \"read\" }"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn execution_timeout_is_deterministic() {
+        let engine = engine(true).unwrap();
+        let module = module(
+            &engine,
+            r#"
+            (module
+              (func (export "handle_request")
+                (loop $forever
+                  br $forever)))
+            "#,
+        );
+
+        let error = invoke(&engine, &module, host_state_with_limits(1, 1, 1)).unwrap_err();
+
+        assert_eq!(error, "wasm execution timed out");
+    }
+
+    #[test]
+    fn execution_timeout_applies_across_host_capability_calls() {
+        let engine = engine(true).unwrap();
+        let module = module(
+            &engine,
+            r#"
+            (module
+              (import "app_capabilities" "network_connect" (func $network_connect))
+              (func (export "handle_request")
+                (loop $forever
+                  call $network_connect
+                  br $forever)))
+            "#,
+        );
+        let mut host_state = host_state_with_limits(1, 1, 1);
+        host_state.network = NetworkCapability::new(true);
+
+        let error = invoke(&engine, &module, host_state).unwrap_err();
+
+        assert_eq!(error, "wasm execution timed out");
+    }
+
+    #[test]
+    fn memory_limit_is_enforced_at_instantiation() {
+        let engine = engine(true).unwrap();
+        let module = module(
+            &engine,
+            r#"
+            (module
+              (memory (export "memory") 17)
+              (func (export "handle_request")))
+            "#,
+        );
+
+        let error = invoke(&engine, &module, host_state_with_limits(1, 1000, 1)).unwrap_err();
+
+        assert!(
+            error.contains("forcing trap when growing memory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn memory_limit_blocks_growth_through_host_capabilities() {
+        let engine = engine(true).unwrap();
+        let module = storage_write_module(&engine, "/data/counter", "value");
+        let mut host_state = host_state_with_limits(1, 1000, 1);
+        host_state.storage =
+            Some(StorageCapability::new("/data", temp_path("limited-state")).unwrap());
+
+        invoke(&engine, &module, host_state).unwrap();
+    }
+
+    #[test]
+    fn request_concurrency_limit_is_enforced_before_execution() {
+        let engine = engine(true).unwrap();
+        let module = module(&engine, r#"(module (func (export "handle_request")))"#);
+        let host_state = host_state_with_limits(1, 1000, 1);
+        let _active = host_state.requests.enter().unwrap();
+
+        let error = invoke(&engine, &module, host_state).unwrap_err();
+
+        assert_eq!(error, "request concurrency limit exceeded");
+    }
+
+    #[test]
+    fn runtime_log_path_uses_application_id_scope() {
+        let home = temp_path("logs-home");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let path = super::log_path("sha256:abc123").unwrap();
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        assert_eq!(
+            path,
+            home.join(".appboundry")
+                .join("runtime")
+                .join("sha256")
+                .join("abc123")
+                .join("runtime.log")
+        );
+    }
+
     fn storage_write_module(engine: &Engine, path: &str, value: &str) -> Module {
         module(
             engine,
@@ -1241,6 +1692,26 @@ mod tests {
                 "#,
                 path_len = path.len(),
                 value_len = value.len()
+            ),
+        )
+    }
+
+    fn network_destination_module(engine: &Engine, destination: &str) -> Module {
+        module(
+            engine,
+            &format!(
+                r#"
+                (module
+                  (import "app_capabilities" "network_connect_to"
+                    (func $network_connect_to (param i32 i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "{destination}")
+                  (func (export "handle_request")
+                    i32.const 0
+                    i32.const {destination_len}
+                    call $network_connect_to))
+                "#,
+                destination_len = destination.len()
             ),
         )
     }
@@ -1280,6 +1751,56 @@ mod tests {
                     i32.const 64
                     i32.const 128
                     call $get_secret
+                    i32.const {expected_len}
+                    i32.ne
+                    if
+                      unreachable
+                    end
+                    {checks}))
+                "#,
+                name_len = name.len(),
+                expected = expected,
+                expected_len = expected.len(),
+                checks = checks
+            ),
+        )
+    }
+
+    fn config_equals_module(engine: &Engine, name: &str, expected: &str) -> Module {
+        let checks = (0..expected.len())
+            .map(|offset| {
+                format!(
+                    r#"
+                    i32.const {}
+                    i32.load8_u
+                    i32.const {}
+                    i32.load8_u
+                    i32.ne
+                    if
+                      unreachable
+                    end"#,
+                    64 + offset,
+                    128 + offset
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        module(
+            engine,
+            &format!(
+                r#"
+                (module
+                  (import "app_capabilities" "get_config"
+                    (func $get_config (param i32 i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 0) "{name}")
+                  (data (i32.const 128) "{expected}")
+                  (func (export "handle_request")
+                    i32.const 0
+                    i32.const {name_len}
+                    i32.const 64
+                    i32.const 128
+                    call $get_config
                     i32.const {expected_len}
                     i32.ne
                     if
