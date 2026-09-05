@@ -219,11 +219,17 @@ impl Manifest {
                         "attributes.appboundry.resources.timeoutMs",
                     )
                 })?,
-                max_concurrent_requests: resources
-                    .get("max_concurrent_requests")
-                    .or_else(|| resources.get("maxConcurrentRequests"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u32,
+                max_concurrent_requests: u32::try_from(
+                    resources
+                        .get("max_concurrent_requests")
+                        .or_else(|| resources.get("maxConcurrentRequests"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1),
+                )
+                .map_err(|_| {
+                    "attributes.appboundry.resources.max_concurrent_requests must fit in u32"
+                        .to_string()
+                })?,
             })
         } else {
             None
@@ -253,9 +259,14 @@ impl Manifest {
                 .and_then(Value::as_object)
                 .and_then(|http| http.get("listen"))
                 .and_then(Value::as_u64)
-                .map(|listen| HttpCapability {
-                    listen: listen as u16,
-                }),
+                .map(|listen| {
+                    u16::try_from(listen)
+                        .map(|listen| HttpCapability { listen })
+                        .map_err(|_| {
+                            "attributes.appboundry.http.listen must fit in u16".to_string()
+                        })
+                })
+                .transpose()?,
             capabilities: ManifestCapabilities {
                 network,
                 filesystem,
