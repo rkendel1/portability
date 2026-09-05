@@ -19,11 +19,15 @@ enum Command {
 fn main() {
     let result = match Cli::parse().command {
         Command::Init { name } => init(&name),
-        Command::Build => app_compiler::build(Path::new(".")).map(|m| {
+        Command::Build => app_compiler::build(Path::new(".")).and_then(|m| {
+            let wasm = fs::read(Path::new("target").join(&m.artifact.file))
+                .map_err(|e| format!("cannot read built artifact: {e}"))?;
+            let application_id = m.application_id(&wasm)?;
             println!(
-                "Compiled {}\nArtifact: sha256:{}",
-                m.name, m.artifact.sha256
-            )
+                "Compiled {}\nApplication ID: {}\nArtifact: sha256:{}",
+                m.name, application_id, m.artifact.sha256
+            );
+            Ok(())
         }),
         Command::Run { manifest } => match manifest {
             Some(manifest) => app_runtime::run_manifest(&manifest),
@@ -66,14 +70,28 @@ fn init(name: &str) -> Result<(), String> {
 
 fn inspect(manifest_path: &Path) -> Result<(), String> {
     let manifest = app_manifest::Manifest::load(manifest_path)?;
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    let artifact_path = manifest_dir.join(&manifest.artifact.file);
+    let wasm = fs::read(&artifact_path)
+        .map_err(|e| format!("cannot read artifact {}: {e}", artifact_path.display()))?;
+    let application_id = manifest.application_id(&wasm)?;
+    let integrity = if app_manifest::sha256(&wasm) == manifest.artifact.sha256 {
+        "verified"
+    } else {
+        "mismatch"
+    };
     println!(
-        "Application: {}\nVersion:     {}\nRuntime:     {}\nArtifact:\n  File:      {}\n  SHA256:    {}\n  Size:      {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nStorage:\n  mount:     {}\n  path:      {}",
+        "Application: {}\nVersion:     {}\nRuntime:     {}\nApplication ID:\n  {}\nArtifact:\n  File:      {}\n  SHA256:    {}\n  Size:      {}\n  Integrity: {}\nCapabilities:\n  http:      {}\n  network:   {}\n  filesystem: {}\nStorage:\n  mount:     {}\n  path:      {}",
         manifest.name,
         manifest.version,
         manifest.runtime,
+        application_id,
         manifest.artifact.file,
         manifest.artifact.sha256,
         manifest.artifact.size,
+        integrity,
         manifest
             .http
             .map(|h| format!("listen :{}", h.listen))

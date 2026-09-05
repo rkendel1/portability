@@ -28,6 +28,15 @@ fn rust_and_go_examples_build_run_and_persist_state() {
         assert!(project.join("target/app.manifest.json").is_file());
         let manifest = fs::read_to_string(project.join("target/app.manifest.json")).unwrap();
         assert!(manifest.contains(r#""file": "app.wasm""#), "{manifest}");
+        let built_inspect = inspect(&project);
+        assert!(
+            built_inspect.contains("  Integrity: verified"),
+            "{built_inspect}"
+        );
+        let built_id = application_id(&built_inspect);
+        app(&project).arg("build").assert_success();
+        let rebuilt_inspect = inspect(&project);
+        assert_eq!(application_id(&rebuilt_inspect), built_id);
 
         let artifact = temp_project(&format!("{example}-artifact"));
         fs::copy(project.join("target/app.wasm"), artifact.join("app.wasm")).unwrap();
@@ -36,6 +45,13 @@ fn rust_and_go_examples_build_run_and_persist_state() {
             artifact.join("app.manifest.json"),
         )
         .unwrap();
+        let relocated_inspect =
+            inspect_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
+        assert!(
+            relocated_inspect.contains("  Integrity: verified"),
+            "{relocated_inspect}"
+        );
+        assert_eq!(application_id(&relocated_inspect), built_id);
 
         let mut portable =
             run_app_manifest(&std::env::temp_dir(), &artifact.join("app.manifest.json"));
@@ -164,6 +180,34 @@ fn app(project: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_app"));
     command.current_dir(project);
     command
+}
+
+fn inspect(project: &Path) -> String {
+    successful_output(app(project).arg("inspect"))
+}
+
+fn inspect_manifest(cwd: &Path, manifest: &Path) -> String {
+    successful_output(app(cwd).arg("inspect").arg(manifest))
+}
+
+fn successful_output(command: &mut Command) -> String {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn application_id(inspect_output: &str) -> &str {
+    inspect_output
+        .lines()
+        .skip_while(|line| *line != "Application ID:")
+        .nth(1)
+        .expect("inspect output should include Application ID")
+        .trim()
 }
 
 trait AssertCommand {
