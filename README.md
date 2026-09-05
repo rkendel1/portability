@@ -10,6 +10,7 @@ cargo run -p app -- build
 cargo run -p app -- run
 cargo run -p app -- run target/app.manifest.json
 cargo run -p app -- run target/app.manifest.json --state /var/lib/app/hello --state-provider filesystem
+cargo run -p app -- run target/app.manifest.json --secret OPENAI_API_KEY
 ```
 
 `app.toml` declares the application, build, runtime, HTTP endpoint, capabilities,
@@ -25,8 +26,8 @@ declared state capability to a local directory.
 The Application ID is `sha256:<hash>` over the deployable application: the
 canonical manifest immediately followed by the WASM bytes. The canonical
 manifest is compact JSON with fields emitted in this order: `name`, `version`,
-`runtime`, `artifact`, `http`, `capabilities`, `storage`; nested objects also use
-the field order shown by `target/app.manifest.json`. The manifest's own
+`runtime`, `artifact`, `http`, `capabilities`, `storage`, `secrets` when present;
+nested objects also use the field order shown by `target/app.manifest.json`. The manifest's own
 `artifact.sha256` still identifies only the WASM bytes for integrity checks.
 
 The v0.1 guest ABI is intentionally small: a guest may export `handle_request`.
@@ -35,6 +36,10 @@ provided through an explicit local-directory capability; paths cannot escape its
 declared root. The same `app.wasm` and `app.manifest.json` can be relocated and
 run against different `--state` directories without changing the Application ID.
 Network access defaults to denied and is checked by the capability boundary.
+Runtime secrets may be declared by name only with `[secrets] required = ["OPENAI_API_KEY"]`.
+Pass `--secret OPENAI_API_KEY` to resolve the value from the local environment
+at runtime; secret values are not written to manifests, WASM artifacts,
+Application IDs, or lifecycle records.
 
 `examples/hello` builds through Rust, and `examples/hello-go` builds through Go.
 Both emit the same `target/app.wasm` and `target/app.manifest.json` artifact
@@ -44,5 +49,5 @@ shape and run through the same `app run` runtime.
 
 v0.1 does not replace Docker for arbitrary Linux applications and does not support
 Dockerfiles, OCI, native binaries, daemons, registries, orchestration, Kubernetes,
-multi-node scheduling, production networking, multi-tenant isolation, secrets
-management, or distributed state.
+multi-node scheduling, production networking, multi-tenant isolation, durable
+secrets management, or distributed state.

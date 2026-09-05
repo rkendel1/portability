@@ -325,6 +325,80 @@ func main() {}
     );
 }
 
+#[test]
+fn rust_secret_is_injected_only_at_runtime() {
+    if !toolchain_available("rust") {
+        return;
+    }
+    let project = temp_project("rust-runtime-secret");
+    let port = free_port();
+    write_secret_project(&project, port);
+    app(&project).arg("build").assert_success();
+    let inspect_output = inspect(&project);
+    let built_id = application_id(&inspect_output).to_string();
+    let manifest = fs::read_to_string(project.join("target/app.manifest.json")).unwrap();
+    let secret_value = "runtime-only-secret";
+
+    assert!(manifest.contains("OPENAI_API_KEY"), "{manifest}");
+    assert!(!manifest.contains(secret_value), "{manifest}");
+    assert!(
+        !fs::read(project.join("target/app.wasm"))
+            .unwrap()
+            .windows(secret_value.len())
+            .any(|window| window == secret_value.as_bytes())
+    );
+    assert!(!built_id.contains(secret_value), "{built_id}");
+
+    let missing_flag = failed_output(app(&project).arg("run").env("OPENAI_API_KEY", secret_value));
+    assert!(
+        missing_flag.contains("required secret 'OPENAI_API_KEY' was not provided"),
+        "{missing_flag}"
+    );
+
+    let missing_env = failed_output(
+        app(&project)
+            .arg("run")
+            .arg("--secret")
+            .arg("OPENAI_API_KEY")
+            .env_remove("OPENAI_API_KEY"),
+    );
+    assert!(
+        missing_env.contains("secret OPENAI_API_KEY requested but environment variable is not set"),
+        "{missing_env}"
+    );
+
+    let lifecycle_home = temp_project("rust-secret-lifecycle-home");
+    let started = successful_output(
+        app(&project)
+            .arg("start")
+            .arg("--secret")
+            .arg("OPENAI_API_KEY")
+            .env("OPENAI_API_KEY", secret_value)
+            .env("HOME", &lifecycle_home),
+    );
+    assert!(started.contains(&built_id), "{started}");
+    wait_for_http(port);
+
+    let record = fs::read_to_string(runtime_record_path(&lifecycle_home, &built_id)).unwrap();
+    assert!(!record.contains(secret_value), "{record}");
+
+    let status = status_manifest_with_home(
+        &project,
+        &project.join("target/app.manifest.json"),
+        &lifecycle_home,
+    );
+    assert!(status.contains("Status:       running"), "{status}");
+    assert!(!status.contains(secret_value), "{status}");
+
+    let stopped = stop_manifest_with_home(
+        &project,
+        &project.join("target/app.manifest.json"),
+        &lifecycle_home,
+    );
+    assert!(stopped.contains("Status:       stopped"), "{stopped}");
+    wait_for_port_release(port);
+}
+
 fn toolchain_available(language: &str) -> bool {
     match language {
         "rust" => Command::new("rustup")
@@ -343,6 +417,63 @@ fn toolchain_available(language: &str) -> bool {
             .is_ok_and(|output| output.status.success()),
         _ => false,
     }
+}
+
+fn write_secret_project(project: &Path, port: u16) {
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("app.toml"),
+        format!(
+            r#"name = "secret-app"
+version = "0.1.0"
+[build]
+source = "src"
+entry = "src/main.rs"
+[runtime]
+kind = "wasm"
+[http]
+listen = {port}
+[capabilities]
+network = false
+filesystem = false
+[secrets]
+required = ["OPENAI_API_KEY"]
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        r#"[package]
+name = "secret-app"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[lib]
+path = "src/main.rs"
+crate-type = ["cdylib"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        r#"#[link(wasm_import_module = "app_capabilities")]
+unsafe extern "C" {
+    fn get_secret(name_ptr: *const u8, name_len: usize, value_ptr: *mut u8, value_len: usize) -> usize;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_request() {
+    const NAME: &[u8] = b"OPENAI_API_KEY";
+    let mut value = [0_u8; 128];
+    unsafe {
+        get_secret(NAME.as_ptr(), NAME.len(), value.as_mut_ptr(), value.len());
+    }
+}
+"#,
+    )
+    .unwrap();
 }
 
 fn app(project: &Path) -> Command {
@@ -491,6 +622,16 @@ fn default_feltdb_state(home: &Path, application_id: &str) -> std::path::PathBuf
         }
     }
     path
+}
+
+fn runtime_record_path(home: &Path, application_id: &str) -> std::path::PathBuf {
+    let mut path = home.join(".appboundry").join("runtime");
+    for segment in application_id.split(':') {
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path.join("runtime.json")
 }
 
 fn run_app_manifest_with_state(cwd: &Path, manifest: &Path, state: &Path) -> Child {
