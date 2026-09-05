@@ -27,13 +27,13 @@ pub struct Manifest {
     pub resources: Option<Resources>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPortMapping {
     pub application_id: String,
     pub operation: AppPortOperation,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPortOperation {
     pub name: String,
     pub version: u64,
@@ -323,6 +323,45 @@ pub fn appport_artifact_file(appport: &Value) -> Result<String, String> {
         .to_string())
 }
 
+pub fn appport_lifecycle_operation(appport: &Value) -> Result<AppPortOperation, String> {
+    if let Some(operation) = appboundry_adapter(appport)?
+        .get("operation")
+        .and_then(Value::as_object)
+    {
+        return Ok(AppPortOperation {
+            name: string_field(operation, "name", "attributes.appboundry.operation.name")?,
+            version: operation_version(
+                operation.get("version"),
+                "attributes.appboundry.operation.version",
+            )?,
+        });
+    }
+
+    let capabilities = appport
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .ok_or("AppPort manifest requires capabilities")?;
+    let [capability] = capabilities.as_slice() else {
+        return Err(
+            "AppPort lifecycle requires attributes.appboundry.operation when multiple capabilities are declared"
+                .into(),
+        );
+    };
+    let capability = capability
+        .as_object()
+        .ok_or("AppPort capability must be an object")?;
+    Ok(AppPortOperation {
+        name: string_field(capability, "name", "AppPort capability.name")?,
+        version: operation_version(
+            capability
+                .get("versions")
+                .and_then(Value::as_array)
+                .and_then(|versions| versions.first()),
+            "AppPort capability.versions[0]",
+        )?,
+    })
+}
+
 impl ApplicationId {
     pub fn from_manifest_and_wasm(manifest: &Manifest, wasm: &[u8]) -> Result<Self, String> {
         let mut identity_bytes = canonical_manifest(manifest)?;
@@ -536,6 +575,12 @@ fn u64_field(
 ) -> Result<u64, String> {
     object
         .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{label} must be an integer"))
+}
+
+fn operation_version(value: Option<&Value>, label: &str) -> Result<u64, String> {
+    value
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("{label} must be an integer"))
 }
