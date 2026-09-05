@@ -20,6 +20,7 @@ use wasmtime::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, Store
 
 #[derive(Clone)]
 struct HostState {
+    application_id: String,
     network: NetworkCapability,
     storage: Option<StorageCapability>,
     secrets: SecretCapability,
@@ -27,6 +28,7 @@ struct HostState {
     limits: StoreLimits,
     execution_fuel: Option<u64>,
     requests: RequestLimiter,
+    execution_units: Arc<AtomicUsize>,
     log_path: Option<PathBuf>,
 }
 
@@ -197,7 +199,8 @@ fn run_from_manifest(
         stream.read(&mut request).map_err(|e| e.to_string())?;
         if let Err(error) = invoke(&engine, &module, host_state.clone()) {
             log_line(&host_state.log_path, &format!("ERROR {error}"))?;
-            return Err(error);
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 21\r\nConnection: close\r\n\r\nWASM execution failed").map_err(|e| e.to_string())?;
+            continue;
         }
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nHello from WASM").map_err(|e| e.to_string())?;
     }
@@ -470,6 +473,7 @@ fn host_state(
         .map(|network| network.outbound.as_slice())
         .unwrap_or(&[]);
     Ok(HostState {
+        application_id: application_id.to_string(),
         network: NetworkCapability::with_destinations(manifest.capabilities.network, destinations),
         storage,
         secrets: SecretCapability::new(&manifest.secrets.required, secrets.clone())
@@ -479,6 +483,7 @@ fn host_state(
         limits: store_limits,
         execution_fuel,
         requests: RequestLimiter::new(request_limit),
+        execution_units: Arc::new(AtomicUsize::new(0)),
         log_path: std::env::var_os("APP_RUNTIME_LOG")
             .map(PathBuf::from)
             .or_else(|| log_path(application_id).ok()),
@@ -680,29 +685,91 @@ fn terminate(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+struct ExecutionUnit {
+    id: usize,
+    application_id: String,
+    store: Store<HostState>,
+    _permit: RequestPermit,
+}
+
+impl ExecutionUnit {
+    fn create(engine: &Engine, host_state: HostState) -> Result<Self, String> {
+        let permit = host_state.requests.enter()?;
+        let id = host_state.execution_units.fetch_add(1, Ordering::SeqCst) + 1;
+        let application_id = host_state.application_id.clone();
+        log_line(
+            &host_state.log_path,
+            &format!("execution-unit {application_id}#{id} create"),
+        )?;
+        let mut unit = Self {
+            id,
+            application_id,
+            store: Store::new(engine, host_state),
+            _permit: permit,
+        };
+        unit.store.limiter(|state| &mut state.limits);
+        if let Some(fuel) = unit.store.data().execution_fuel {
+            if let Err(error) = unit.store.set_fuel(fuel).map_err(|e| e.to_string()) {
+                unit.fail(&error).ok();
+                return Err(error);
+            }
+        }
+        Ok(unit)
+    }
+
+    fn execute(&mut self, linker: &Linker<HostState>, module: &Module) -> Result<(), String> {
+        self.log("execute")?;
+        let result: Result<(), String> = (|| {
+            let instance = linker
+                .instantiate(&mut self.store, module)
+                .map_err(runtime_error)?;
+            if let Some(initialize) = instance.get_func(&mut self.store, "_initialize") {
+                initialize
+                    .call(&mut self.store, &[], &mut [])
+                    .map_err(runtime_error)?;
+            }
+            if let Some(handle) = instance.get_func(&mut self.store, "handle_request") {
+                handle
+                    .call(&mut self.store, &[], &mut [])
+                    .map_err(runtime_error)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.log("complete")?;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(&error).ok();
+                Err(error)
+            }
+        }
+    }
+
+    fn fail(&mut self, error: &str) -> Result<(), String> {
+        self.log(&format!("fail {error}"))
+    }
+
+    fn log(&self, event: &str) -> Result<(), String> {
+        log_line(
+            &self.store.data().log_path,
+            &format!("execution-unit {}#{} {event}", self.application_id, self.id),
+        )
+    }
+}
+
+impl Drop for ExecutionUnit {
+    fn drop(&mut self) {
+        self.log("dispose").ok();
+    }
+}
+
 fn invoke(engine: &Engine, module: &Module, host_state: HostState) -> Result<(), String> {
-    let _permit = host_state.requests.enter()?;
     let mut linker = Linker::new(engine);
     add_host_functions(&mut linker)?;
-    let mut store = Store::new(engine, host_state);
-    store.limiter(|state| &mut state.limits);
-    if let Some(fuel) = store.data().execution_fuel {
-        store.set_fuel(fuel).map_err(|e| e.to_string())?;
-    }
-    let instance = linker
-        .instantiate(&mut store, module)
-        .map_err(runtime_error)?;
-    if let Some(initialize) = instance.get_func(&mut store, "_initialize") {
-        initialize
-            .call(&mut store, &[], &mut [])
-            .map_err(runtime_error)?;
-    }
-    if let Some(handle) = instance.get_func(&mut store, "handle_request") {
-        handle
-            .call(&mut store, &[], &mut [])
-            .map_err(runtime_error)?;
-    }
-    Ok(())
+    let mut unit = ExecutionUnit::create(engine, host_state)?;
+    unit.execute(&linker, module)
 }
 
 fn runtime_error(error: wasmtime::Error) -> String {
@@ -1077,6 +1144,7 @@ mod tests {
 
     fn host_state(network: bool, storage: Option<StorageCapability>) -> HostState {
         HostState {
+            application_id: "test-application-id".into(),
             network: NetworkCapability::new(network),
             storage,
             secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
@@ -1084,6 +1152,7 @@ mod tests {
             limits: StoreLimitsBuilder::new().instances(1).build(),
             execution_fuel: None,
             requests: RequestLimiter::new(1),
+            execution_units: Arc::new(AtomicUsize::new(0)),
             log_path: None,
         }
     }
@@ -1102,6 +1171,7 @@ mod tests {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
         HostState {
+            application_id: "test-application-id".into(),
             network: NetworkCapability::new(false),
             storage,
             secrets: SecretCapability::new(&required, values).unwrap(),
@@ -1109,6 +1179,7 @@ mod tests {
             limits: StoreLimitsBuilder::new().instances(1).build(),
             execution_fuel: None,
             requests: RequestLimiter::new(1),
+            execution_units: Arc::new(AtomicUsize::new(0)),
             log_path: None,
         }
     }
@@ -1123,6 +1194,7 @@ mod tests {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
         HostState {
+            application_id: "test-application-id".into(),
             network: NetworkCapability::new(false),
             storage: None,
             secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
@@ -1130,6 +1202,7 @@ mod tests {
             limits: StoreLimitsBuilder::new().instances(1).build(),
             execution_fuel: None,
             requests: RequestLimiter::new(1),
+            execution_units: Arc::new(AtomicUsize::new(0)),
             log_path: None,
         }
     }
@@ -1146,6 +1219,7 @@ mod tests {
         };
         let (limits, fuel, request_limit) = runtime_limits(Some(&resources)).unwrap();
         HostState {
+            application_id: "test-application-id".into(),
             network: NetworkCapability::new(false),
             storage: None,
             secrets: SecretCapability::new(&[], RuntimeSecrets::new()).unwrap(),
@@ -1153,6 +1227,7 @@ mod tests {
             limits,
             execution_fuel: fuel,
             requests: RequestLimiter::new(request_limit),
+            execution_units: Arc::new(AtomicUsize::new(0)),
             log_path: None,
         }
     }
@@ -1472,6 +1547,64 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn disposable_execution_units_preserve_application_state_after_success_and_failure() {
+        let tempdir = temp_path("recyclable-state");
+        let log_path = temp_path("recyclable-logs").join("runtime.log");
+        let application_id = "sha256:recyclable-test";
+        let engine = Engine::default();
+        let write = storage_write_module(&engine, "/data/counter", "42");
+        let read = storage_read_equals_module(&engine, "/data/counter", "42");
+        let crash = module(
+            &engine,
+            r#"
+            (module
+              (func (export "handle_request")
+                unreachable))
+            "#,
+        );
+
+        let mut healthy_state = host_state(
+            false,
+            Some(StorageCapability::new("/data", &tempdir).unwrap()),
+        );
+        healthy_state.application_id = application_id.into();
+        healthy_state.log_path = Some(log_path.clone());
+
+        invoke(&engine, &write, healthy_state.clone()).unwrap();
+        assert_eq!(fs::read_to_string(tempdir.join("counter")).unwrap(), "42");
+        invoke(&engine, &read, healthy_state.clone()).unwrap();
+        assert_eq!(healthy_state.application_id, application_id);
+
+        let mut recovery_state = host_state(
+            false,
+            Some(StorageCapability::new("/data", &tempdir).unwrap()),
+        );
+        recovery_state.application_id = application_id.into();
+        recovery_state.log_path = Some(log_path.clone());
+
+        let error = invoke(&engine, &crash, recovery_state.clone()).unwrap_err();
+        assert!(error.contains("unreachable"), "{error}");
+        invoke(&engine, &read, recovery_state.clone()).unwrap();
+        assert_eq!(fs::read_to_string(tempdir.join("counter")).unwrap(), "42");
+        assert_eq!(recovery_state.application_id, application_id);
+
+        let logs = fs::read_to_string(log_path).unwrap();
+        for expected in [
+            "execution-unit sha256:recyclable-test#1 create",
+            "execution-unit sha256:recyclable-test#1 execute",
+            "execution-unit sha256:recyclable-test#1 complete",
+            "execution-unit sha256:recyclable-test#1 dispose",
+            "execution-unit sha256:recyclable-test#2 create",
+            "execution-unit sha256:recyclable-test#2 execute",
+            "execution-unit sha256:recyclable-test#2 complete",
+            "execution-unit sha256:recyclable-test#2 dispose",
+            "execution-unit sha256:recyclable-test#1 fail",
+        ] {
+            assert!(logs.contains(expected), "{expected}\n{logs}");
+        }
     }
 
     #[test]
